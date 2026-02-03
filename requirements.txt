@@ -1,0 +1,8 @@
+fastapi==0.115.6
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+pydantic==2.10.4
+qwen-tts==0.0.5
+torch>=2.2
+pytest==8.3.4
+httpx==0.28.1
