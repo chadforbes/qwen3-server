@@ -54,10 +54,38 @@ docker run --rm -p 8000:8000 -v ${PWD}\audio:/app/audio qwen-tts-server
 
 ## Endpoints
 
-- `POST /upload` (multipart) → creates `session_id` and stores `source.wav` under `audio/uploads/<session_id>/source.wav`
+- `POST /preview` (multipart) → Upload a source audio file, its transcription, and the desired response text. Returns a synthesized preview audio file in the cloned voice. (Replaces `/upload`)
 - `GET /previews/{job_id}.wav` → serves preview WAV if not expired
 - `GET /health` → ok
 - `WS /ws` → JSON messages (see below)
+
+### `/preview` endpoint usage
+
+**Request:**
+
+`POST /preview`
+
+Form-data (multipart):
+- `audio`: WAV file (reference voice)
+- `transcription`: Text transcription of the audio
+- `response_text`: The text to synthesize in the cloned voice
+
+**Response:**
+- Returns a WAV audio file containing the synthesized response in the cloned voice.
+
+**Example (using curl):**
+
+```sh
+curl -X POST http://localhost:8000/preview \
+	-F "audio=@source.wav" \
+	-F "transcription=Hello, this is my voice." \
+	-F "response_text=How can I help you today?" \
+	--output preview.wav
+```
+
+---
+
+> **Note:** The old `/upload` endpoint is now deprecated. Use `/preview` for uploading audio and generating previews in a single step.
 
 ## WebSocket messages
 

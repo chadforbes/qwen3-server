@@ -90,23 +90,64 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/upload")
-async def upload(file: UploadFile = File(...)):
+
+# Deprecated: /upload endpoint
+# @app.post("/upload")
+# async def upload(file: UploadFile = File(...)):
+#     settings = app.state.settings
+#     session = new_session(settings)
+#     data = await file.read()
+#     # Store as source.wav (as per spec). Caller should upload WAV.
+#     session.source_path.write_bytes(data)
+#     return {"session_id": session.session_id}
+
+# New /preview endpoint: accepts audio, transcription, and response text, returns generated audio
+from fastapi import Form
+from fastapi.responses import StreamingResponse
+import io
+
+@app.post("/preview")
+async def preview(
+    audio: UploadFile = File(...),
+    transcription: str = Form(...),
+    response_text: str = Form(...),
+):
     settings = app.state.settings
+    backend = app.state.tts_backend
+    # Create a temp session folder
     session = new_session(settings)
-    data = await file.read()
-    # Store as source.wav (as per spec). Caller should upload WAV.
-    session.source_path.write_bytes(data)
-    return {"session_id": session.session_id}
+    audio_data = await audio.read()
+    session.source_path.write_bytes(audio_data)
+    # Save transcription alongside audio for traceability (optional)
+    transcription_path = session.folder / "transcription.txt"
+    transcription_path.write_text(transcription)
+    # Synthesize preview using the uploaded audio and transcription
+    # (Assume backend uses transcription for improved voice cloning if supported)
+    out_wav = session.folder / "preview.wav"
+    try:
+        await asyncio.to_thread(
+            backend.synthesize_preview,
+            text=response_text,
+            source_wav=session.source_path,
+            out_wav=out_wav,
+        )
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    # Return the generated audio file as a streaming response
+    return StreamingResponse(
+        io.BytesIO(out_wav.read_bytes()),
+        media_type="audio/wav",
+        headers={"Content-Disposition": f"attachment; filename=preview.wav"},
+    )
 
 
-@app.get("/previews/{job_id}.wav")
-async def get_preview(job_id: str):
-    settings = app.state.settings
-    path = settings.previews_dir / f"{job_id}.wav"
-    if not path.exists():
-        return JSONResponse(status_code=404, content={"error": "not_found"})
-    return _safe_file_response(path)
+# @app.get("/previews/{job_id}.wav")
+# async def get_preview(job_id: str):
+#     settings = app.state.settings
+#     path = settings.previews_dir / f"{job_id}.wav"
+#     if not path.exists():
+#         return JSONResponse(status_code=404, content={"error": "not_found"})
+#     return _safe_file_response(path)
 
 
 @app.websocket("/ws")
