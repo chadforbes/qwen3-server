@@ -1,7 +1,0 @@
-INFO:     Started server process [51336]
-INFO:     Waiting for application startup.
-'sox' is not recognized as an internal or external command,
-operable program or batch file.
-Fetching 4 files:   0%|          | 0/4 [00:00<?, ?it/s]Fetching 4 files: 100%|##########| 4/4 [00:00<00:00, 7839.82it/s]
-INFO:     Application startup complete.
-INFO:     Uvicorn running on http://127.0.0.1:8011 (Press CTRL+C to quit)

@@ -13,7 +13,7 @@ Implements the voice creation + preview lifecycle:
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-python -m uvicorn app.main:app --reload --port 8000
+python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 ## Qwen3 TTS backend
@@ -32,6 +32,7 @@ Environment variables:
 - `QWEN_TTS_MODEL_ID` = `Qwen/Qwen3-TTS-12Hz-0.6B-Base` (default)
 - `PRELOAD_MODEL_ON_STARTUP` = `1` (default) to download/load model during startup
 - `LOG_LEVEL` = `INFO` (default)
+- `CORS_ALLOW_ORIGINS` = `*` (default). Comma-separated origins (e.g. `http://homeassistant.local:8123`). Set to `none` to disable.
 
 Notes:
 
@@ -58,6 +59,13 @@ docker run --rm -p 8000:8000 -v ${PWD}\audio:/app/audio qwen-tts-server
 - `GET /previews/{job_id}.wav` → serves preview WAV if not expired
 - `GET /health` → ok
 - `WS /ws` → JSON messages (see below)
+
+Compatibility aliases (same behavior):
+
+- `GET /api/health`
+- `POST /api/upload`
+- `GET /api/previews/{job_id}.wav`
+- `WS /api/ws`
 
 ## WebSocket messages
 

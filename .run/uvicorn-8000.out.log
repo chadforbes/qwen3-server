@@ -1,0 +1,14 @@
+INFO:     127.0.0.1:62801 - "POST /upload HTTP/1.1" 200 OK
+2026-02-04T03:33:10Z INFO app.ws: voice_saved voice_id=nova name=Nova
+2026-02-04T03:33:20Z WARNING app.ws: ws validation error: Uploaded source.wav not found for session
+INFO:     127.0.0.1:62828 - "POST /api/upload HTTP/1.1" 200 OK
+2026-02-04T03:33:38Z WARNING app.ws: ws validation error: Voice name already exists
+INFO:     127.0.0.1:54946 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64182 - "OPTIONS /upload HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64191 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64191 - "OPTIONS /upload HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64200 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64200 - "GET /api/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64200 - "GET /healthz HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64200 - "GET /ingress/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64200 - "GET /ingress/api/health HTTP/1.1" 200 OK
