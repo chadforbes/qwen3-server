@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, UploadFile, WebSocket
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
 from .config import get_settings
@@ -30,16 +28,6 @@ log = logging.getLogger(__name__)
 def _safe_file_response(path: Path) -> FileResponse:
     # FileResponse will stream the file; this helper keeps a single place for settings.
     return FileResponse(path=str(path), media_type="audio/wav")
-
-
-def _cors_origins_from_env() -> list[str] | None:
-    raw = (os.getenv("CORS_ALLOW_ORIGINS", "*") or "").strip()
-    if not raw:
-        return None
-    if raw.lower() in {"none", "off", "false", "0"}:
-        return None
-    origins = [o.strip() for o in raw.split(",") if o.strip()]
-    return origins or None
 
 
 @asynccontextmanager
@@ -88,16 +76,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-_cors_origins = _cors_origins_from_env()
-if _cors_origins is not None:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=_cors_origins,
-        allow_credentials=False,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
 
 @app.get("/")
 def root():
@@ -112,23 +90,6 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/api/health")
-def health_api():
-    return health()
-
-
-@app.get("/healthz")
-def healthz():
-    return health()
-
-
-@app.get("/ingress/health")
-@app.get("/ingress/api/health")
-@app.get("/ingress/healthz")
-def health_ingress():
-    return health()
-
-
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
     settings = app.state.settings
@@ -137,17 +98,6 @@ async def upload(file: UploadFile = File(...)):
     # Store as source.wav (as per spec). Caller should upload WAV.
     session.source_path.write_bytes(data)
     return {"session_id": session.session_id}
-
-
-@app.post("/api/upload")
-async def upload_api(file: UploadFile = File(...)):
-    return await upload(file=file)
-
-
-@app.post("/ingress/upload")
-@app.post("/ingress/api/upload")
-async def upload_ingress(file: UploadFile = File(...)):
-    return await upload(file=file)
 
 
 @app.get("/previews/{job_id}.wav")
@@ -159,30 +109,8 @@ async def get_preview(job_id: str):
     return _safe_file_response(path)
 
 
-@app.get("/api/previews/{job_id}.wav")
-async def get_preview_api(job_id: str):
-    return await get_preview(job_id=job_id)
-
-
-@app.get("/ingress/previews/{job_id}.wav")
-@app.get("/ingress/api/previews/{job_id}.wav")
-async def get_preview_ingress(job_id: str):
-    return await get_preview(job_id=job_id)
-
-
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
     settings = app.state.settings
     backend = app.state.tts_backend
     await ws_loop(settings, backend, websocket)
-
-
-@app.websocket("/api/ws")
-async def ws_endpoint_api(websocket: WebSocket):
-    await ws_endpoint(websocket)
-
-
-@app.websocket("/ingress/ws")
-@app.websocket("/ingress/api/ws")
-async def ws_endpoint_ingress(websocket: WebSocket):
-    await ws_endpoint(websocket)
