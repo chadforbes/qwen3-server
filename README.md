@@ -54,8 +54,6 @@ Notes:
 - With `DEVICE=auto`, the server will use `cuda` if `torch.cuda.is_available()` is true, otherwise CPU.
 - With CUDA, `TORCH_DTYPE=auto` will prefer `float16` to reduce VRAM usage.
 
-Notes:
-
 - First run will download the model from Hugging Face.
 - `embedding.json` stores a Qwen "voice clone prompt" when using `qwen`.
 - On Windows, `qwen-tts` may require the SoX binary (`sox`) on your `PATH`.
@@ -69,8 +67,8 @@ pip install --index-url https://download.pytorch.org/whl/cpu torch
 ## Run (Docker)
 
 ```powershell
-docker build -t qwen-tts-server .
-docker run --rm -p 8000:8000 -v ${PWD}\audio:/app/audio qwen-tts-server
+docker build -t qwen3-server .
+docker run --rm -p 8000:8000 -v ${PWD}\audio:/app/audio qwen3-server
 ```
 
 ### Run (Docker + NVIDIA GPU)
@@ -84,7 +82,7 @@ You need:
 Example:
 
 ```powershell
-docker run --rm -p 8000:8000 -v ${PWD}\\audio:/app/audio --gpus all -e DEVICE=cuda -e TORCH_DTYPE=float16 qwen-tts-server
+docker run --rm -p 8000:8000 -v ${PWD}\audio:/app/audio --gpus all -e DEVICE=cuda -e TORCH_DTYPE=float16 qwen3-server
 ```
 
 > Note: the current `Dockerfile` is CPU-oriented (`python:3.11-slim`). For best GPU support, we should add a separate CUDA base image (e.g., `nvidia/cuda:*`) or a `Dockerfile.gpu` variant and install the matching CUDA PyTorch wheel.
@@ -92,7 +90,7 @@ docker run --rm -p 8000:8000 -v ${PWD}\\audio:/app/audio --gpus all -e DEVICE=cu
 ## Endpoints
 
 - `POST /preview` (multipart) → Upload a source audio file, its transcription, and the desired response text. Returns a synthesized preview audio file in the cloned voice. (Replaces `/upload`)
-- `GET /previews/{job_id}.wav` → serves preview WAV if not expired
+- `GET /previews/{job_id}.wav` → (optional) serve preview WAV by job id (only if enabled in code)
 - `GET /health` → ok
 - `WS /ws` → JSON messages (see below)
 
@@ -157,7 +155,7 @@ Receive:
 ## Tests
 
 ```powershell
-pytest -q
+python -m pytest -q
 ```
 
 Clean test artifacts:
