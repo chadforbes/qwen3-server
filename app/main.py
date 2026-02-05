@@ -4,9 +4,14 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
+import time
+import uuid
 
 from fastapi import FastAPI, File, UploadFile, WebSocket
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
 
 from .config import get_settings
 from .storage import (
@@ -20,6 +25,8 @@ from .storage import (
 from .ws import ws_loop
 from .tts_backend import build_backend
 from .logging_config import configure_logging
+from .log_context import set_correlation_id
+from .log_utils import safe_preview_payload
 
 
 log = logging.getLogger(__name__)
@@ -33,10 +40,18 @@ def _safe_file_response(path: Path) -> FileResponse:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
-    configure_logging(settings.log_level)
+    configure_logging(settings.log_level, fmt=settings.log_format)
     ensure_dirs(settings)
     app.state.settings = settings
     app.state.tts_backend = build_backend(settings)
+
+    log.info(
+        "startup settings tts_backend=%s audio_root=%s log_level=%s log_format=%s",
+        settings.tts_backend,
+        settings.audio_root,
+        settings.log_level,
+        settings.log_format,
+    )
 
     if settings.preload_model_on_startup:
         # This blocks startup intentionally so the first request doesn't hit a cold/missing model.
@@ -77,6 +92,32 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+class RequestLoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next) -> Response:
+        settings = request.app.state.settings
+        cid = request.headers.get("x-correlation-id") or uuid.uuid4().hex[:16]
+        set_correlation_id(cid)
+        start = time.perf_counter()
+        try:
+            response = await call_next(request)
+            return response
+        finally:
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+            # Avoid logging request bodies here; endpoints can opt-in.
+            log.info(
+                "http %s %s status=%s duration_ms=%s client=%s",
+                request.method,
+                request.url.path,
+                getattr(locals().get("response"), "status_code", "-"),
+                elapsed_ms,
+                request.client.host if request.client else "-",
+            )
+            set_correlation_id(None)
+
+
+app.add_middleware(RequestLoggingMiddleware)
+
+
 @app.get("/")
 def root():
     return {
@@ -114,10 +155,19 @@ async def preview(
 ):
     settings = app.state.settings
     backend = app.state.tts_backend
+    log.info(
+        "preview_request filename=%s content_type=%s transcription_len=%s response_text_len=%s",
+        getattr(audio, "filename", "-"),
+        getattr(audio, "content_type", "-"),
+        len(transcription or ""),
+        len(response_text or ""),
+    )
     # Create a temp session folder
     session = new_session(settings)
+    log.info("preview_session_created session_id=%s", session.session_id)
     audio_data = await audio.read()
     session.source_path.write_bytes(audio_data)
+    log.info("preview_audio_saved session_id=%s bytes=%s", session.session_id, len(audio_data))
     # Save transcription alongside audio for traceability (optional)
     transcription_path = session.folder / "transcription.txt"
     transcription_path.write_text(transcription)
@@ -125,13 +175,27 @@ async def preview(
     # (Assume backend uses transcription for improved voice cloning if supported)
     out_wav = session.folder / "preview.wav"
     try:
+        t0 = time.perf_counter()
         await asyncio.to_thread(
             backend.synthesize_preview,
             text=response_text,
             source_wav=session.source_path,
             out_wav=out_wav,
         )
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        log.info(
+            "preview_synth_complete session_id=%s out_bytes=%s duration_ms=%s text=%s",
+            session.session_id,
+            out_wav.stat().st_size if out_wav.exists() else 0,
+            elapsed_ms,
+            safe_preview_payload(response_text, limit_chars=settings.log_payload_chars),
+        )
     except Exception as e:
+        log.exception(
+            "preview_synth_failed session_id=%s text=%s",
+            session.session_id,
+            safe_preview_payload(response_text, limit_chars=settings.log_payload_chars),
+        )
         return JSONResponse(status_code=500, content={"error": str(e)})
     # Return the generated audio file as a streaming response
     return StreamingResponse(

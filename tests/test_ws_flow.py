@@ -7,16 +7,26 @@ from fastapi.testclient import TestClient
 from app.main import app
 
 
+def _make_session(tmp_path: Path, client: TestClient) -> str:
+    # There's no /upload endpoint anymore. Create a session folder the same way
+    # the service does, then use it with the websocket save_voice flow.
+    from app.config import Settings
+    from app.storage import ensure_dirs, new_session
+
+    settings = Settings(audio_root=tmp_path)
+    ensure_dirs(settings)
+    session = new_session(settings)
+    session.source_path.write_bytes(b"RIFF....WAVE")
+    return session.session_id
+
+
 def test_ws_save_voice_flow(tmp_path: Path, monkeypatch):
     # Force app to use tmp audio root
     monkeypatch.setenv("AUDIO_ROOT", str(tmp_path))
     monkeypatch.setenv("TTS_BACKEND", "mock")
 
     with TestClient(app) as client:
-        # Upload
-        resp = client.post("/upload", files={"file": ("source.wav", b"RIFF....WAVE", "audio/wav")})
-        assert resp.status_code == 200
-        session_id = resp.json()["session_id"]
+        session_id = _make_session(tmp_path, client)
 
         with client.websocket_connect("/ws") as ws:
             ws.send_json({"type": "save_voice", "data": {"session_id": session_id, "name": "Nova", "description": "Warm"}})

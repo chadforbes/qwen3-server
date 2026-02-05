@@ -16,6 +16,13 @@ pip install -r requirements.txt
 python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
+To run with multiple workers (note: `--reload` doesn’t combine well with multi-worker), prefer:
+
+```powershell
+$env:UVICORN_WORKERS="2"
+python -m app
+```
+
 ## Qwen3 TTS backend
 
 This server runs Qwen3 TTS via `qwen-tts` (default backend).
@@ -32,6 +39,20 @@ Environment variables:
 - `QWEN_TTS_MODEL_ID` = `Qwen/Qwen3-TTS-12Hz-0.6B-Base` (default)
 - `PRELOAD_MODEL_ON_STARTUP` = `1` (default) to download/load model during startup
 - `LOG_LEVEL` = `INFO` (default)
+- `LOG_FORMAT` = `text` (default) or `json`
+- `LOG_PAYLOAD_CHARS` = `500` (default)
+- `UVICORN_WORKERS` = `1` (default)
+
+GPU / Torch selection:
+
+- `DEVICE` = `auto` (default) | `cpu` | `cuda` | `cuda:0`
+- `DEVICE_MAP` = `auto` (default) | `cpu` | `cuda`
+- `TORCH_DTYPE` = `auto` (default) | `float32` | `float16` | `bfloat16`
+
+Notes:
+
+- With `DEVICE=auto`, the server will use `cuda` if `torch.cuda.is_available()` is true, otherwise CPU.
+- With CUDA, `TORCH_DTYPE=auto` will prefer `float16` to reduce VRAM usage.
 
 Notes:
 
@@ -51,6 +72,22 @@ pip install --index-url https://download.pytorch.org/whl/cpu torch
 docker build -t qwen-tts-server .
 docker run --rm -p 8000:8000 -v ${PWD}\audio:/app/audio qwen-tts-server
 ```
+
+### Run (Docker + NVIDIA GPU)
+
+You need:
+
+- NVIDIA GPU drivers installed on the host
+- NVIDIA Container Toolkit installed (so Docker can expose the GPU)
+- A CUDA-enabled PyTorch wheel inside the image (see note below)
+
+Example:
+
+```powershell
+docker run --rm -p 8000:8000 -v ${PWD}\\audio:/app/audio --gpus all -e DEVICE=cuda -e TORCH_DTYPE=float16 qwen-tts-server
+```
+
+> Note: the current `Dockerfile` is CPU-oriented (`python:3.11-slim`). For best GPU support, we should add a separate CUDA base image (e.g., `nvidia/cuda:*`) or a `Dockerfile.gpu` variant and install the matching CUDA PyTorch wheel.
 
 ## Endpoints
 

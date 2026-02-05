@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import uuid
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -13,6 +14,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .config import Settings
+
+
+log = logging.getLogger(__name__)
 
 
 _NAME_MAX_LEN = 80
@@ -43,6 +47,13 @@ def ensure_dirs(settings: Settings) -> None:
     settings.previews_dir.mkdir(parents=True, exist_ok=True)
     settings.uploads_dir.mkdir(parents=True, exist_ok=True)
     settings.voices_dir.mkdir(parents=True, exist_ok=True)
+    log.info(
+        "storage_dirs_ready audio_root=%s previews=%s uploads=%s voices=%s",
+        settings.audio_root,
+        settings.previews_dir,
+        settings.uploads_dir,
+        settings.voices_dir,
+    )
 
 
 def new_session(settings: Settings) -> UploadSession:
@@ -50,6 +61,7 @@ def new_session(settings: Settings) -> UploadSession:
     folder = settings.uploads_dir / session_id
     source_path = folder / "source.wav"
     folder.mkdir(parents=True, exist_ok=False)
+    log.info("storage_new_session session_id=%s", session_id)
     return UploadSession(session_id=session_id, folder=folder, source_path=source_path)
 
 
@@ -147,6 +159,12 @@ def save_voice(
     if not session.source_path.exists():
         raise ValidationError("Uploaded source.wav not found for session")
 
+    log.info(
+        "storage_save_voice_begin session_id=%s name=%s",
+        session_id,
+        name.strip() if isinstance(name, str) else "-",
+    )
+
     voice_id = compute_voice_id(settings, name)
     desc = validate_description(description)
 
@@ -159,6 +177,7 @@ def save_voice(
 
     # Move uploaded source.wav into permanent location
     shutil.move(str(session.source_path), str(dest_source))
+    log.info("storage_save_voice_moved_source voice_id=%s", voice_id)
 
     # Remove now-empty upload folder (best-effort)
     try:
@@ -183,6 +202,11 @@ def save_voice(
         out_path=dest_metadata,
     )
 
+    log.info(
+        "storage_save_voice_done voice_id=%s embedding_type=%s",
+        voice_id,
+        embedding_payload.get("type") if isinstance(embedding_payload, dict) else "-",
+    )
     return {"voice_id": voice_id, "name": name.strip(), "description": desc}
 
 

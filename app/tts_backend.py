@@ -60,11 +60,54 @@ class QwenTTSBackend:
                 "Qwen TTS backend not available. Install dependencies: pip install qwen-tts torch"
             ) from e
 
-        self._model = Qwen3TTSModel.from_pretrained(
+        # Device selection
+        device = (self._settings.device or "auto").lower()
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        # device_map: allow override, else follow device.
+        device_map = (self._settings.device_map or "auto").lower()
+        if device_map == "auto":
+            # qwen-tts expects a string like "cpu" / "cuda" here.
+            device_map = "cuda" if device.startswith("cuda") else "cpu"
+
+        # dtype selection
+        dtype_setting = (self._settings.torch_dtype or "auto").lower()
+        if dtype_setting == "auto":
+            # CUDA defaults to float16 to reduce VRAM; CPU stays float32.
+            dtype = torch.float16 if device.startswith("cuda") else torch.float32
+        else:
+            dtype = {
+                "float32": torch.float32,
+                "float16": torch.float16,
+                "bfloat16": torch.bfloat16,
+            }.get(dtype_setting, torch.float32)
+
+        self._log.info(
+            "Loading Qwen3 TTS model model_id=%s device=%s device_map=%s dtype=%s cuda_available=%s",
             self._settings.qwen_model_id,
-            device_map="cpu",
-            dtype=torch.float32,
+            device,
+            device_map,
+            str(dtype).replace("torch.", ""),
+            torch.cuda.is_available(),
         )
+
+        try:
+            self._model = Qwen3TTSModel.from_pretrained(
+                self._settings.qwen_model_id,
+                device_map=device_map,
+                dtype=dtype,
+            )
+        except Exception:
+            # If CUDA was requested but fails (missing drivers, wrong torch wheel), fall back to CPU.
+            if device.startswith("cuda") or device_map == "cuda":
+                self._log.exception("Failed to load model on CUDA; falling back to CPU")
+                self._model = Qwen3TTSModel.from_pretrained(
+                    self._settings.qwen_model_id,
+                    device_map="cpu",
+                    dtype=torch.float32,
+                )
+            else:
+                raise
         return self._model
 
     def ensure_ready(self) -> None:
