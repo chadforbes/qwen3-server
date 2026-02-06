@@ -5,7 +5,6 @@ import json
 import os
 import re
 import shutil
-import uuid
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -32,10 +31,17 @@ class ValidationError(StorageError):
 
 
 @dataclass(frozen=True)
-class UploadSession:
-    session_id: str
+class LatestPreview:
+    """Stable location for the most recent preview's source artifacts.
+
+    This intentionally isn't keyed by session id, so clients can follow a simple
+    'upload/generate preview, then save' flow without tracking ids.
+    """
+
     folder: Path
     source_path: Path
+    transcription_path: Path
+    meta_path: Path
 
 
 def utc_now() -> datetime:
@@ -56,21 +62,71 @@ def ensure_dirs(settings: Settings) -> None:
     )
 
 
-def new_session(settings: Settings) -> UploadSession:
-    session_id = uuid.uuid4().hex
-    folder = settings.uploads_dir / session_id
+def latest_preview(settings: Settings) -> LatestPreview:
+    folder = settings.uploads_dir / "latest"
     source_path = folder / "source.wav"
-    folder.mkdir(parents=True, exist_ok=False)
-    log.info("storage_new_session session_id=%s", session_id)
-    return UploadSession(session_id=session_id, folder=folder, source_path=source_path)
+    transcription_path = folder / "transcription.txt"
+    meta_path = folder / "meta.json"
+    return LatestPreview(
+        folder=folder,
+        source_path=source_path,
+        transcription_path=transcription_path,
+        meta_path=meta_path,
+    )
 
 
-def get_session(settings: Settings, session_id: str) -> UploadSession:
-    if not re.fullmatch(r"[0-9a-f]{32}", session_id):
-        raise ValidationError("Invalid session_id")
-    folder = settings.uploads_dir / session_id
-    source_path = folder / "source.wav"
-    return UploadSession(session_id=session_id, folder=folder, source_path=source_path)
+def write_latest_preview(
+    *,
+    settings: Settings,
+    source_wav_bytes: bytes,
+    transcription: str,
+    extra_meta: Optional[dict[str, Any]] = None,
+) -> LatestPreview:
+    """Persist most recent preview source audio and transcript.
+
+    Writes atomically (best-effort) so readers won't see partial state.
+    """
+
+    lp = latest_preview(settings)
+    lp.folder.mkdir(parents=True, exist_ok=True)
+
+    # Atomic-ish write: write to temp files then replace.
+    tmp_source = lp.folder / "source.wav.tmp"
+    tmp_trans = lp.folder / "transcription.txt.tmp"
+    tmp_meta = lp.folder / "meta.json.tmp"
+
+    tmp_source.write_bytes(source_wav_bytes)
+    tmp_trans.write_text(transcription or "", encoding="utf-8")
+
+    meta: dict[str, Any] = {
+        "saved_at": utc_now().astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "source_file": "source.wav",
+        "transcription_file": "transcription.txt",
+        "source_bytes": len(source_wav_bytes),
+        "transcription_len": len(transcription or ""),
+    }
+    if extra_meta:
+        # Avoid surprising nested objects; keep it JSON-serializable.
+        try:
+            json.dumps(extra_meta)
+            meta.update(extra_meta)
+        except TypeError:
+            pass
+    tmp_meta.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    os.replace(tmp_source, lp.source_path)
+    os.replace(tmp_trans, lp.transcription_path)
+    os.replace(tmp_meta, lp.meta_path)
+
+    return lp
+
+
+def load_latest_preview(settings: Settings) -> LatestPreview:
+    lp = latest_preview(settings)
+    if not lp.source_path.exists():
+        raise ValidationError("No latest preview source.wav found")
+    # transcription may be missing for older flows; treat as optional.
+    return lp
 
 
 def _slugify_name(name: str) -> str:
@@ -230,20 +286,23 @@ def write_metadata_json(
 def save_voice(
     *,
     settings: Settings,
-    session_id: str,
+    session_id: Optional[str] = None,
     name: str,
     description: Optional[str],
     embedding_provider: Optional[Any] = None,
 ) -> dict[str, str]:
-    session = get_session(settings, session_id)
-    if not session.source_path.exists():
-        raise ValidationError("Uploaded source.wav not found for session")
+    if session_id is not None:
+        # We're intentionally moving away from session-id based uploads.
+        raise ValidationError("session_id is no longer supported; use latest preview")
 
-    session_transcription = session.folder / "transcription.txt"
+    latest = load_latest_preview(settings)
+    source_path = latest.source_path
+    session_transcription = latest.transcription_path
+    log.info("storage_save_voice_using_latest_preview")
 
     log.info(
         "storage_save_voice_begin session_id=%s name=%s",
-        session_id,
+        "latest",
         name.strip() if isinstance(name, str) else "-",
     )
 
@@ -259,24 +318,20 @@ def save_voice(
     dest_transcription = vdir / "transcription.txt"
 
     # Move uploaded source.wav into permanent location
-    shutil.move(str(session.source_path), str(dest_source))
+    shutil.copy2(str(source_path), str(dest_source))
     log.info("storage_save_voice_moved_source voice_id=%s", voice_id)
 
     # Persist transcription if present. Best-effort: old clients/sessions may not have it.
     transcription_saved = False
     if session_transcription.exists():
         try:
-            shutil.move(str(session_transcription), str(dest_transcription))
+            shutil.copy2(str(session_transcription), str(dest_transcription))
             transcription_saved = True
             log.info("storage_save_voice_moved_transcription voice_id=%s", voice_id)
         except Exception:
             log.exception("storage_save_voice_transcription_move_failed voice_id=%s", voice_id)
 
-    # Remove now-empty upload folder (best-effort)
-    try:
-        shutil.rmtree(session.folder)
-    except FileNotFoundError:
-        pass
+    # Do not delete the reserved latest preview folder.
 
     if embedding_provider is not None:
         embedding_payload = embedding_provider.create_embedding(source_wav=dest_source)
@@ -353,6 +408,9 @@ def cleanup_uploads_sync(settings: Settings) -> int:
 
     for session_dir in settings.uploads_dir.iterdir():
         if not session_dir.is_dir():
+            continue
+        # Reserved folder for 'most recent preview' artifacts.
+        if session_dir.name == "latest":
             continue
         source = session_dir / "source.wav"
         # If source.wav is missing, treat as removable.

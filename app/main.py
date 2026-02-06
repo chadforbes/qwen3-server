@@ -19,10 +19,9 @@ from .storage import (
     cleanup_previews,
     cleanup_uploads,
     ensure_dirs,
-    get_session,
     list_voices,
+    write_latest_preview,
     load_voice_transcription,
-    new_session,
     voice_source_wav,
 )
 from .ws import ws_loop
@@ -189,30 +188,37 @@ async def preview(
         len(transcription or ""),
         len(response_text or ""),
     )
-    # Create a temp session folder
-    session = new_session(settings)
-    log.info("preview_session_created session_id=%s", session.session_id)
     audio_data = await audio.read()
-    session.source_path.write_bytes(audio_data)
-    log.info("preview_audio_saved session_id=%s bytes=%s", session.session_id, len(audio_data))
-    # Save transcription alongside audio for traceability (optional)
-    transcription_path = session.folder / "transcription.txt"
-    transcription_path.write_text(transcription)
+    log.info("preview_audio_received bytes=%s", len(audio_data))
+
+    # Persist stable 'latest preview' artifacts.
+    try:
+        lp = write_latest_preview(
+            settings=settings,
+            source_wav_bytes=audio_data,
+            transcription=transcription,
+            extra_meta={"origin": "http_preview"},
+        )
+    except Exception as e:
+        log.exception("preview_write_latest_failed")
+        return JSONResponse(status_code=500, content={"error": f"Failed to save latest preview: {e}"})
     # Synthesize preview using the uploaded audio and transcription
     # (Assume backend uses transcription for improved voice cloning if supported)
-    out_wav = session.folder / "preview.wav"
+    out_dir = settings.previews_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_wav = out_dir / "preview-latest.wav"
     try:
         t0 = time.perf_counter()
         await asyncio.to_thread(
             backend.synthesize_preview,
             text=response_text,
-            source_wav=session.source_path,
+            source_wav=lp.source_path,
             out_wav=out_wav,
         )
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
         log.info(
             "preview_synth_complete session_id=%s out_bytes=%s duration_ms=%s text=%s",
-            session.session_id,
+            "latest",
             out_wav.stat().st_size if out_wav.exists() else 0,
             elapsed_ms,
             safe_preview_payload(response_text, limit_chars=settings.log_payload_chars),
@@ -220,7 +226,7 @@ async def preview(
     except Exception as e:
         log.exception(
             "preview_synth_failed session_id=%s text=%s",
-            session.session_id,
+            "latest",
             safe_preview_payload(response_text, limit_chars=settings.log_payload_chars),
         )
         return JSONResponse(status_code=500, content={"error": str(e)})

@@ -1,13 +1,15 @@
-# Qwen TTS Server (Voice Lifecycle)
+# Qwen TTS Server (voice cloning + saved voices)
 
-Implements the voice creation + preview lifecycle:
+This is a small FastAPI server that wraps Qwen3 TTS for a simple workflow:
 
-- Upload reference audio (temporary, 12h retention unless saved)
-- Generate preview audio (temporary, 20m retention)
-- Save voice (moves upload to permanent voice folder + writes metadata/embedding)
-- Background asyncio cleanup tasks
+1) Upload reference audio + transcript and generate a preview
+2) If you like it, save that voice for later
+3) Generate future previews from the saved voice without re-uploading
 
-## Run (local)
+> Current model: **single-user / no sessions**. The server always operates on the
+> most recently uploaded reference audio under `audio/uploads/latest/`.
+
+## Quickstart (local)
 
 ```powershell
 python -m venv .venv
@@ -29,15 +31,21 @@ $env:UVICORN_WORKERS="2"
 python -m app
 ```
 
-## Qwen3 TTS backend
+> Note: with `UVICORN_WORKERS>1`, the server is still usable, but the **no-session
+> “latest upload wins”** model can behave unexpectedly under concurrent users.
+> This repo intentionally optimizes for a single real user right now.
+
+## Backend: Qwen3 TTS
 
 This server runs Qwen3 TTS via `qwen-tts` (default backend).
 
-This implementation uses Qwen in **voice cloning** mode only:
+This implementation uses Qwen in **voice cloning** mode only.
 
-- The uploaded `audio/uploads/<session_id>/source.wav` is the reference voice.
-- `generate_preview` synthesizes speech in the cloned voice.
-- `save_voice` persists a Qwen voice-clone prompt into `audio/voices/<voice_id>/embedding.json`.
+- Latest reference audio:
+	- `audio/uploads/latest/source.wav`
+	- `audio/uploads/latest/transcription.txt`
+- Generating previews uses the latest reference
+- Saving a voice persists the reference under `audio/voices/<voice_id>/`
 
 Environment variables:
 
@@ -66,7 +74,7 @@ Notes:
 
 If you run into Torch install issues, install the appropriate wheel explicitly (CPU or CUDA) as shown above.
 
-## Run (Docker)
+## Quickstart (Docker)
 
 ```powershell
 docker build -t qwen3-server .
@@ -113,39 +121,78 @@ docker run --rm -p 8000:8000 -v ${PWD}\audio:/app/audio --gpus all -e DEVICE=cud
 
 ## Endpoints
 
-- `POST /preview` (multipart) → Upload a source audio file, its transcription, and the desired response text. Returns a synthesized preview audio file in the cloned voice. (Replaces `/upload`)
-- `POST /preview-from-voice` (multipart form) → Generate a preview using a previously saved voice (`voice_id`). This uses the saved voice's `source.wav` + saved transcription, and the new `response_text`.
-- `GET /voices` → List saved voices
-- `GET /previews/{job_id}.wav` → (optional) serve preview WAV by job id (only if enabled in code)
-- `GET /health` → ok
-- `WS /ws` → JSON messages (see below)
+### HTTP
 
-### `/preview` endpoint usage
+- `GET /health` → `{ "status": "ok" }`
+- `GET /voices` → list saved voices (metadata)
+- `POST /preview` (multipart) → upload reference audio + transcript and generate a preview WAV
+- `POST /preview-from-voice` (multipart form) → generate a preview from a saved `voice_id`
+
+### WebSocket
+
+- `WS /ws` → JSON messages (`generate_preview`, `save_voice`)
+
+## End-to-end workflow
+
+### 1) Upload + preview (HTTP)
+
+`POST /preview` multipart form-data:
+
+- `audio`: WAV file (reference voice)
+- `transcription`: text transcript of the audio
+- `response_text`: the text to synthesize in the cloned voice
+
+Response:
+
+- HTTP 200
+- `Content-Type: audio/wav`
+- Body is the preview WAV bytes
+
+Example:
+
+```sh
+curl -X POST http://localhost:8000/preview \
+	-F "audio=@source.wav" \
+	-F "transcription=Hello, this is my voice." \
+	-F "response_text=How can I help you today?" \
+	--output preview.wav
+```
 
 
-### Saved voices: list + use
+### 2) Save voice (WebSocket)
 
-Saved voices are created via the WebSocket `save_voice` message (see below). Once saved, you can:
+Once you like what you heard, save the current latest reference voice:
 
-- List them via `GET /voices`
-- Generate previews without uploading reference audio again via `POST /preview-from-voice`
+Send:
 
-When a voice is saved, the server will also persist `transcription.txt` into the voice folder if it exists in the upload session.
+```json
+{ "type": "save_voice", "data": { "name": "Nova", "description": "Warm" } }
+```
 
-`POST /preview-from-voice` form-data:
+Receive:
+
+```json
+{ "type": "voice_saved", "data": { "voice_id": "nova", "name": "Nova", "description": "Warm" } }
+```
+
+Notes:
+
+- The server always saves from the most recent upload: `audio/uploads/latest/*`.
+- If there is no latest upload yet, call `POST /preview` first.
+
+After saving, you can:
+
+- list via `GET /voices`
+- preview via `POST /preview-from-voice`
+
+When a voice is saved, the server will also persist `transcription.txt` into the voice folder if it exists in `uploads/latest/`.
+
+### 3) Preview from a saved voice (HTTP)
+
+`POST /preview-from-voice` multipart form-data:
 
 - `voice_id`: the saved voice id (e.g., `nova`)
 - `response_text`: the text to synthesize
-
-**Request:**
-
-`POST /preview`
-
-Form-data (multipart):
-- `audio`: WAV file (reference voice)
-- `transcription`: Text transcription of the audio
-- `response_text`: The text to synthesize in the cloned voice
-
 
 Example using a saved voice:
 
@@ -168,10 +215,6 @@ curl -X POST http://localhost:8000/preview \
 	--output preview.wav
 ```
 
----
-
-> **Note:** The old `/upload` endpoint is now deprecated. Use `/preview` for uploading audio and generating previews in a single step.
-
 ## WebSocket messages
 
 ### Generate preview
@@ -179,7 +222,7 @@ curl -X POST http://localhost:8000/preview \
 Send:
 
 ```json
-{ "type": "generate_preview", "data": { "session_id": "...", "text": "Hello" } }
+{ "type": "generate_preview", "data": { "text": "Hello" } }
 ```
 
 Receive:
@@ -190,24 +233,24 @@ Receive:
 
 ### Save voice
 
-Send:
+See the workflow section above.
 
-```json
-{ "type": "save_voice", "data": { "name": "Nova", "description": "Warm" } }
-```
+## Files on disk
 
-Notes:
+The server writes under `AUDIO_ROOT` (default `./audio`):
 
-- `session_id` is optional. If you previously called `generate_preview` on the **same WebSocket connection**, the server will save the most recent preview session automatically.
-- For backwards compatibility, you may still send `session_id` explicitly.
-
-This persists the **original reference** `source.wav` and its `transcription.txt` from that session into `audio/voices/<voice_id>/`, along with `metadata.json` and `embedding.json`.
-
-Receive:
-
-```json
-{ "type": "voice_saved", "data": { "voice_id": "nova", "name": "Nova", "description": "Warm" } }
-```
+- `audio/uploads/latest/`
+	- `source.wav` (most recent reference audio)
+	- `transcription.txt` (most recent transcript)
+	- `meta.json` (timestamps + sizes)
+- `audio/previews/`
+	- `preview-latest.wav` (last HTTP `/preview` output)
+	- `<job_id>.wav` (WS `generate_preview` outputs, cleaned up periodically)
+- `audio/voices/<voice_id>/`
+	- `source.wav`
+	- `transcription.txt` (if available)
+	- `metadata.json`
+	- `embedding.json`
 
 ## Tests
 

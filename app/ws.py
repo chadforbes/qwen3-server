@@ -11,7 +11,7 @@ from typing import Any
 from fastapi import WebSocket
 
 from .config import Settings
-from .storage import ValidationError, get_session, preview_path, save_voice
+from .storage import ValidationError, load_latest_preview, preview_path, save_voice
 from .tts_backend import TTSBackend, TTSError
 from .log_context import set_correlation_id
 from .log_utils import safe_preview_payload
@@ -38,42 +38,37 @@ async def handle_message(
         raise ValidationError("Invalid message format")
 
     if msg_type == "generate_preview":
-        session_id = data.get("session_id")
         text = data.get("text")
-        if not isinstance(session_id, str):
-            raise ValidationError("session_id is required")
         if not isinstance(text, str):
             raise ValidationError("text is required")
 
-        session = get_session(settings, session_id)
-        if not session.source_path.exists():
-            raise ValidationError("Uploaded source.wav not found for session")
-
-        # Remember last session for this connection so later `save_voice` can omit it.
-        state["last_session_id"] = session_id
+        latest = load_latest_preview(settings)
+        source_wav = latest.source_path
+        # Remember that this connection is using the latest preview artifacts.
+        state["use_latest_preview"] = True
 
         job_id = secrets.token_urlsafe(9).replace("-", "_").replace("~", "_")[:12]
         out_wav = preview_path(settings, job_id)
 
         log.info(
             "ws_generate_preview_start session_id=%s text=%s",
-            session_id,
+            "latest",
             safe_preview_payload(text, limit_chars=settings.log_payload_chars),
         )
         # Real preview generation (non-blocking)
         try:
             t0 = time.perf_counter()
-            await asyncio.to_thread(backend.synthesize_preview, text=text, source_wav=session.source_path, out_wav=out_wav)
+            await asyncio.to_thread(backend.synthesize_preview, text=text, source_wav=source_wav, out_wav=out_wav)
             elapsed_ms = int((time.perf_counter() - t0) * 1000)
             log.info(
                 "ws_generate_preview_done session_id=%s job_id=%s out_bytes=%s duration_ms=%s",
-                session_id,
+                "latest",
                 job_id,
                 out_wav.stat().st_size if out_wav.exists() else 0,
                 elapsed_ms,
             )
         except TTSError as e:
-            log.exception("generate_preview failed (session_id=%s)", session_id)
+            log.exception("generate_preview failed")
             raise ValidationError(str(e))
 
         await ws_send(
@@ -84,13 +79,11 @@ async def handle_message(
         return
 
     if msg_type == "save_voice":
-        session_id = data.get("session_id")
         name = data.get("name")
         description = data.get("description")
-        if session_id is None:
-            session_id = state.get("last_session_id")
-        if not isinstance(session_id, str):
-            raise ValidationError("session_id is required (or generate_preview must be called first)")
+        # In no-session mode, we save from the stable latest-preview artifacts.
+        # We don't require a prior generate_preview call; /preview may have already
+        # populated uploads/latest.
         if not isinstance(name, str):
             raise ValidationError("name is required")
         if description is not None and not isinstance(description, str):
@@ -98,14 +91,14 @@ async def handle_message(
 
         log.info(
             "ws_save_voice_start session_id=%s name=%s desc_len=%s",
-            session_id,
+            "latest",
             name,
             len(description or "") if isinstance(description, str) or description is None else -1,
         )
         result = await asyncio.to_thread(
             save_voice,
             settings=settings,
-            session_id=session_id,
+            session_id=None,
             name=name,
             description=description,
             embedding_provider=backend,

@@ -3,23 +3,34 @@ from __future__ import annotations
 import asyncio
 import json
 
-import httpx
+import requests
 import websockets
 
 
-async def main() -> None:
-    # Run server separately (see README). This script assumes localhost:8000.
-    async with httpx.AsyncClient(base_url="http://127.0.0.1:8000") as client:
-        r = await client.post("/upload", files={"file": ("source.wav", b"RIFF....WAVE", "audio/wav")})
-        r.raise_for_status()
-        session_id = r.json()["session_id"]
+async def main():
+    # No-session flow:
+    # 1) POST /preview to seed uploads/latest (reference audio + transcription)
+    # 2) WS generate_preview uses uploads/latest
+    # 3) WS save_voice persists from uploads/latest
 
-    async with websockets.connect("ws://127.0.0.1:8000/ws") as ws:
-        await ws.send(json.dumps({"type": "generate_preview", "data": {"session_id": session_id, "text": "Hello"}}))
-        print(await ws.recv())
+    with open("./audio/uploads/test.wav", "rb") as f:
+        r = requests.post(
+            "http://localhost:8000/preview",
+            files={"audio": ("test.wav", f, "audio/wav")},
+            data={"transcription": "Hello", "response_text": "Hello"},
+        )
+    r.raise_for_status()
+    # Response is audio/wav bytes
+    print(f"/preview -> status={r.status_code} bytes={len(r.content)}")
 
-        await ws.send(json.dumps({"type": "save_voice", "data": {"session_id": session_id, "name": "Nova", "description": "Warm"}}))
-        print(await ws.recv())
+    async with websockets.connect("ws://localhost:8000/ws") as ws:
+        await ws.send(json.dumps({"type": "generate_preview", "data": {"text": "Hello"}}))
+        msg = await ws.recv()
+        print(msg)
+
+        await ws.send(json.dumps({"type": "save_voice", "data": {"name": "Nova", "description": "Warm"}}))
+        msg = await ws.recv()
+        print(msg)
 
 
 if __name__ == "__main__":

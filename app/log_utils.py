@@ -17,7 +17,7 @@ def truncate(text: str, limit: int) -> str:
 
 def redact_auth(value: str) -> str:
     # Redact bearer tokens if they appear inside loggable strings.
-    return _AUTH_RE.sub(r"\\1 ***", value)
+    return _AUTH_RE.sub(r"\1 ***", value)
 
 
 def safe_preview_payload(payload: Any, *, limit_chars: int) -> str:
