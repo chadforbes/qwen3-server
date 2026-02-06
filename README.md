@@ -196,6 +196,8 @@ Send:
 { "type": "save_voice", "data": { "session_id": "...", "name": "Nova", "description": "Warm" } }
 ```
 
+This persists the **original reference** `source.wav` and its `transcription.txt` from that session into `audio/voices/<voice_id>/`, along with `metadata.json` and `embedding.json`.
+
 Receive:
 
 ```json
