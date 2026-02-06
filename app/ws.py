@@ -24,7 +24,14 @@ async def ws_send(websocket: WebSocket, msg_type: str, data: dict[str, Any]) -> 
     await websocket.send_text(json.dumps({"type": msg_type, "data": data}))
 
 
-async def handle_message(settings: Settings, backend: TTSBackend, websocket: WebSocket, message: dict[str, Any]) -> None:
+async def handle_message(
+    settings: Settings,
+    backend: TTSBackend,
+    websocket: WebSocket,
+    message: dict[str, Any],
+    *,
+    state: dict[str, Any],
+) -> None:
     msg_type = message.get("type")
     data = message.get("data") or {}
     if not isinstance(msg_type, str) or not isinstance(data, dict):
@@ -41,6 +48,9 @@ async def handle_message(settings: Settings, backend: TTSBackend, websocket: Web
         session = get_session(settings, session_id)
         if not session.source_path.exists():
             raise ValidationError("Uploaded source.wav not found for session")
+
+        # Remember last session for this connection so later `save_voice` can omit it.
+        state["last_session_id"] = session_id
 
         job_id = secrets.token_urlsafe(9).replace("-", "_").replace("~", "_")[:12]
         out_wav = preview_path(settings, job_id)
@@ -77,8 +87,10 @@ async def handle_message(settings: Settings, backend: TTSBackend, websocket: Web
         session_id = data.get("session_id")
         name = data.get("name")
         description = data.get("description")
+        if session_id is None:
+            session_id = state.get("last_session_id")
         if not isinstance(session_id, str):
-            raise ValidationError("session_id is required")
+            raise ValidationError("session_id is required (or generate_preview must be called first)")
         if not isinstance(name, str):
             raise ValidationError("name is required")
         if description is not None and not isinstance(description, str):
@@ -115,6 +127,7 @@ async def ws_loop(settings: Settings, backend: TTSBackend, websocket: WebSocket)
     client = getattr(websocket.client, "host", None) if websocket.client else None
     log.info("ws_connected client=%s", client or "-")
     await websocket.accept()
+    state: dict[str, Any] = {}
     try:
         while True:
             raw = await websocket.receive_text()
@@ -127,7 +140,7 @@ async def ws_loop(settings: Settings, backend: TTSBackend, websocket: WebSocket)
                 message = json.loads(raw)
                 if not isinstance(message, dict):
                     raise ValidationError("Message must be a JSON object")
-                await handle_message(settings, backend, websocket, message)
+                await handle_message(settings, backend, websocket, message, state=state)
             except ValidationError as e:
                 log.warning("ws validation error: %s", e)
                 await ws_send(websocket, "error", {"message": str(e)})

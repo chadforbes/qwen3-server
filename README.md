@@ -193,8 +193,13 @@ Receive:
 Send:
 
 ```json
-{ "type": "save_voice", "data": { "session_id": "...", "name": "Nova", "description": "Warm" } }
+{ "type": "save_voice", "data": { "name": "Nova", "description": "Warm" } }
 ```
+
+Notes:
+
+- `session_id` is optional. If you previously called `generate_preview` on the **same WebSocket connection**, the server will save the most recent preview session automatically.
+- For backwards compatibility, you may still send `session_id` explicitly.
 
 This persists the **original reference** `source.wav` and its `transcription.txt` from that session into `audio/voices/<voice_id>/`, along with `metadata.json` and `embedding.json`.
 
