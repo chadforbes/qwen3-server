@@ -20,7 +20,10 @@ from .storage import (
     cleanup_uploads,
     ensure_dirs,
     get_session,
+    list_voices,
+    load_voice_transcription,
     new_session,
+    voice_source_wav,
 )
 from .ws import ws_loop
 from .tts_backend import build_backend
@@ -44,6 +47,19 @@ async def lifespan(app: FastAPI):
     ensure_dirs(settings)
     app.state.settings = settings
     app.state.tts_backend = build_backend(settings)
+
+    # Torch diagnostics (helps confirm whether container has CUDA-enabled torch)
+    try:
+        import torch
+
+        log.info(
+            "torch runtime torch_version=%s cuda_available=%s cuda_devices=%s",
+            getattr(torch, "__version__", "-"),
+            torch.cuda.is_available(),
+            torch.cuda.device_count() if torch.cuda.is_available() else 0,
+        )
+    except Exception:
+        log.info("torch runtime not available")
 
     log.info(
         "startup settings tts_backend=%s audio_root=%s log_level=%s log_format=%s",
@@ -131,6 +147,17 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/voices")
+def voices_list():
+    """List saved voices.
+
+    Saved voices are created via the WebSocket `save_voice` flow.
+    """
+
+    settings = app.state.settings
+    return {"voices": list_voices(settings)}
+
+
 
 # Deprecated: /upload endpoint
 # @app.post("/upload")
@@ -202,6 +229,70 @@ async def preview(
         io.BytesIO(out_wav.read_bytes()),
         media_type="audio/wav",
         headers={"Content-Disposition": f"attachment; filename=preview.wav"},
+    )
+
+
+@app.post("/preview-from-voice")
+async def preview_from_voice(
+    voice_id: str = Form(...),
+    response_text: str = Form(...),
+):
+    """Generate a preview using a previously saved voice.
+
+    This avoids re-uploading the reference audio on every call.
+    """
+
+    settings = app.state.settings
+    backend = app.state.tts_backend
+
+    try:
+        source_wav = voice_source_wav(settings, voice_id)
+    except ValidationError as e:
+        return JSONResponse(status_code=404, content={"error": str(e)})
+
+    saved_transcription = load_voice_transcription(settings, voice_id)
+
+    out_dir = settings.audio_root / "previews"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    job_id = uuid.uuid4().hex[:12]
+    out_wav = out_dir / f"{job_id}.wav"
+
+    log.info(
+        "preview_from_voice_request voice_id=%s response_text_len=%s saved_transcription_len=%s",
+        voice_id,
+        len(response_text or ""),
+        len(saved_transcription or ""),
+    )
+
+    try:
+        t0 = time.perf_counter()
+        await asyncio.to_thread(
+            backend.synthesize_preview,
+            text=response_text,
+            source_wav=source_wav,
+            out_wav=out_wav,
+        )
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        log.info(
+            "preview_from_voice_complete voice_id=%s job_id=%s out_bytes=%s duration_ms=%s text=%s",
+            voice_id,
+            job_id,
+            out_wav.stat().st_size if out_wav.exists() else 0,
+            elapsed_ms,
+            safe_preview_payload(response_text, limit_chars=settings.log_payload_chars),
+        )
+    except Exception as e:
+        log.exception(
+            "preview_from_voice_failed voice_id=%s text=%s",
+            voice_id,
+            safe_preview_payload(response_text, limit_chars=settings.log_payload_chars),
+        )
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+    return StreamingResponse(
+        io.BytesIO(out_wav.read_bytes()),
+        media_type="audio/wav",
+        headers={"Content-Disposition": "attachment; filename=preview.wav"},
     )
 
 

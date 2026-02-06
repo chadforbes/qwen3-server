@@ -2,7 +2,11 @@ fastapi==0.115.6
 uvicorn[standard]==0.30.6
 python-multipart==0.0.9
 pydantic==2.10.4
-qwen-tts==0.0.5
-torch>=2.2
+
+# qwen-tts runtime deps we rely on (qwen-tts itself is installed in Docker with
+# --no-deps to avoid pulling torchaudio / CUDA-linked wheels).
+transformers==4.57.3
+accelerate==1.12.0
+
 pytest==8.3.4
 httpx==0.28.1

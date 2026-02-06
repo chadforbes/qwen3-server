@@ -12,6 +12,12 @@ Implements the voice creation + preview lifecycle:
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+
+# Install PyTorch first (pick CPU or CUDA):
+pip install --index-url https://download.pytorch.org/whl/cpu torch
+# For CUDA (example):
+# pip install --index-url https://download.pytorch.org/whl/cu121 torch
+
 pip install -r requirements.txt
 python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
@@ -58,17 +64,32 @@ Notes:
 - `embedding.json` stores a Qwen "voice clone prompt" when using `qwen`.
 - On Windows, `qwen-tts` may require the SoX binary (`sox`) on your `PATH`.
 
-If you run into Torch install issues on CPU-only machines, install the CPU wheel explicitly:
-
-```powershell
-pip install --index-url https://download.pytorch.org/whl/cpu torch
-```
+If you run into Torch install issues, install the appropriate wheel explicitly (CPU or CUDA) as shown above.
 
 ## Run (Docker)
 
 ```powershell
 docker build -t qwen3-server .
 docker run --rm -p 8000:8000 -v ${PWD}\audio:/app/audio qwen3-server
+```
+
+### Docker build: CPU vs GPU (single Dockerfile)
+
+This repo uses a **single** `Dockerfile`.
+
+- Default build installs **CPU** PyTorch.
+- To build a CUDA-enabled image, pass build args to install the CUDA PyTorch wheel.
+
+CPU (default):
+
+```powershell
+docker build -t qwen3-server .
+```
+
+CUDA (example: cu121):
+
+```powershell
+docker build -t qwen3-server:cu121 --build-arg TORCH_VARIANT=cuda --build-arg TORCH_CUDA=cu121 .
 ```
 
 ### Run (Docker + NVIDIA GPU)
@@ -82,19 +103,39 @@ You need:
 Example:
 
 ```powershell
-docker run --rm -p 8000:8000 -v ${PWD}\audio:/app/audio --gpus all -e DEVICE=cuda -e TORCH_DTYPE=float16 qwen3-server
+docker run --rm -p 8000:8000 -v ${PWD}\audio:/app/audio --gpus all -e DEVICE=cuda -e TORCH_DTYPE=float16 qwen3-server:cu121
 ```
 
-> Note: the current `Dockerfile` is CPU-oriented (`python:3.11-slim`). For best GPU support, we should add a separate CUDA base image (e.g., `nvidia/cuda:*`) or a `Dockerfile.gpu` variant and install the matching CUDA PyTorch wheel.
+> Note: The base image is still `python:3.11-slim`. CUDA-enabled PyTorch inside the container still requires:
+> - NVIDIA drivers on the host
+> - NVIDIA Container Toolkit
+> - `docker run --gpus all ...`
 
 ## Endpoints
 
 - `POST /preview` (multipart) → Upload a source audio file, its transcription, and the desired response text. Returns a synthesized preview audio file in the cloned voice. (Replaces `/upload`)
+- `POST /preview-from-voice` (multipart form) → Generate a preview using a previously saved voice (`voice_id`). This uses the saved voice's `source.wav` + saved transcription, and the new `response_text`.
+- `GET /voices` → List saved voices
 - `GET /previews/{job_id}.wav` → (optional) serve preview WAV by job id (only if enabled in code)
 - `GET /health` → ok
 - `WS /ws` → JSON messages (see below)
 
 ### `/preview` endpoint usage
+
+
+### Saved voices: list + use
+
+Saved voices are created via the WebSocket `save_voice` message (see below). Once saved, you can:
+
+- List them via `GET /voices`
+- Generate previews without uploading reference audio again via `POST /preview-from-voice`
+
+When a voice is saved, the server will also persist `transcription.txt` into the voice folder if it exists in the upload session.
+
+`POST /preview-from-voice` form-data:
+
+- `voice_id`: the saved voice id (e.g., `nova`)
+- `response_text`: the text to synthesize
 
 **Request:**
 
@@ -105,6 +146,15 @@ Form-data (multipart):
 - `transcription`: Text transcription of the audio
 - `response_text`: The text to synthesize in the cloned voice
 
+
+Example using a saved voice:
+
+```sh
+curl -X POST http://localhost:8000/preview-from-voice \
+  -F "voice_id=nova" \
+  -F "response_text=How can I help you today?" \
+  --output preview.wav
+```
 **Response:**
 - Returns a WAV audio file containing the synthesized response in the cloned voice.
 

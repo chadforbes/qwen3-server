@@ -114,6 +114,86 @@ def voice_dir(settings: Settings, voice_id: str) -> Path:
     return settings.voices_dir / voice_id
 
 
+def load_voice_metadata(settings: Settings, voice_id: str) -> dict[str, Any]:
+    """Load saved voice metadata.json for a voice.
+
+    Raises ValidationError if the voice doesn't exist or metadata is invalid.
+    """
+
+    vdir = voice_dir(settings, voice_id)
+    meta_path = vdir / "metadata.json"
+    if not meta_path.exists():
+        raise ValidationError("Voice not found")
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise StorageError("Failed to read voice metadata") from e
+    if not isinstance(meta, dict):
+        raise StorageError("Invalid voice metadata")
+    return meta
+
+
+def list_voices(settings: Settings) -> list[dict[str, Any]]:
+    """Return saved voices (metadata) sorted by voice_id."""
+
+    if not settings.voices_dir.exists():
+        return []
+
+    voices: list[dict[str, Any]] = []
+    for child in settings.voices_dir.iterdir():
+        if not child.is_dir():
+            continue
+        voice_id = child.name
+        try:
+            meta = load_voice_metadata(settings, voice_id)
+        except ValidationError:
+            # Skip malformed entries.
+            continue
+        except StorageError:
+            continue
+        # Ensure id is always present
+        meta.setdefault("voice_id", voice_id)
+        voices.append(meta)
+
+    voices.sort(key=lambda v: str(v.get("voice_id") or ""))
+    return voices
+
+
+def voice_source_wav(settings: Settings, voice_id: str) -> Path:
+    """Return path to saved voice's source.wav.
+
+    Raises ValidationError if voice doesn't exist.
+    """
+
+    vdir = voice_dir(settings, voice_id)
+    source = vdir / "source.wav"
+    if not source.exists():
+        raise ValidationError("Voice not found")
+    return source
+
+
+def voice_transcription_path(settings: Settings, voice_id: str) -> Path:
+    """Return path to saved voice's transcription.txt.
+
+    May not exist for voices created before transcription was persisted.
+    """
+
+    vdir = voice_dir(settings, voice_id)
+    return vdir / "transcription.txt"
+
+
+def load_voice_transcription(settings: Settings, voice_id: str) -> str:
+    """Load a saved voice transcription, or return empty string if missing."""
+
+    path = voice_transcription_path(settings, voice_id)
+    if not path.exists():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+
 def preview_path(settings: Settings, job_id: str) -> Path:
     if not re.fullmatch(r"[a-zA-Z0-9_-]{6,64}", job_id):
         raise ValidationError("Invalid job_id")
@@ -159,6 +239,8 @@ def save_voice(
     if not session.source_path.exists():
         raise ValidationError("Uploaded source.wav not found for session")
 
+    session_transcription = session.folder / "transcription.txt"
+
     log.info(
         "storage_save_voice_begin session_id=%s name=%s",
         session_id,
@@ -174,10 +256,21 @@ def save_voice(
     dest_source = vdir / "source.wav"
     dest_embedding = vdir / "embedding.json"
     dest_metadata = vdir / "metadata.json"
+    dest_transcription = vdir / "transcription.txt"
 
     # Move uploaded source.wav into permanent location
     shutil.move(str(session.source_path), str(dest_source))
     log.info("storage_save_voice_moved_source voice_id=%s", voice_id)
+
+    # Persist transcription if present. Best-effort: old clients/sessions may not have it.
+    transcription_saved = False
+    if session_transcription.exists():
+        try:
+            shutil.move(str(session_transcription), str(dest_transcription))
+            transcription_saved = True
+            log.info("storage_save_voice_moved_transcription voice_id=%s", voice_id)
+        except Exception:
+            log.exception("storage_save_voice_transcription_move_failed voice_id=%s", voice_id)
 
     # Remove now-empty upload folder (best-effort)
     try:
@@ -201,6 +294,17 @@ def save_voice(
         created_at=utc_now(),
         out_path=dest_metadata,
     )
+
+    if transcription_saved:
+        # Patch metadata.json to include transcription file reference.
+        try:
+            meta = json.loads(dest_metadata.read_text(encoding="utf-8"))
+            if isinstance(meta, dict):
+                meta["transcription_file"] = "transcription.txt"
+                dest_metadata.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        except Exception:
+            # Non-fatal; transcription is still present on disk.
+            log.exception("storage_save_voice_metadata_patch_failed voice_id=%s", voice_id)
 
     log.info(
         "storage_save_voice_done voice_id=%s embedding_type=%s",
