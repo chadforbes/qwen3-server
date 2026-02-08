@@ -18,7 +18,7 @@ python -m venv .venv
 # Install PyTorch first (pick CPU or CUDA):
 pip install --index-url https://download.pytorch.org/whl/cpu torch
 # For CUDA (example):
-# pip install --index-url https://download.pytorch.org/whl/cu121 torch
+# pip install --index-url https://download.pytorch.org/whl/cu128 torch
 
 pip install -r requirements.txt
 python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
@@ -77,9 +77,11 @@ If you run into Torch install issues, install the appropriate wheel explicitly (
 ## Quickstart (Docker)
 
 ```powershell
-docker build -t qwen3-server .
+docker build -t qwen3-server --target runtime .
 docker run --rm -p 8000:8000 -v ${PWD}\audio:/app/audio qwen3-server
 ```
+
+This build uses the `runtime` stage, which avoids installing dev/test dependencies.
 
 ### Docker build: CPU vs GPU (single Dockerfile)
 
@@ -91,13 +93,22 @@ This repo uses a **single** `Dockerfile`.
 CPU (default):
 
 ```powershell
-docker build -t qwen3-server .
+docker build -t qwen3-server --target runtime .
 ```
 
-CUDA (example: cu121):
+CUDA (example: cu128):
 
 ```powershell
-docker build -t qwen3-server:cu121 --build-arg TORCH_VARIANT=cuda --build-arg TORCH_CUDA=cu121 .
+docker build -t qwen3-server:cu128 --target runtime --build-arg TORCH_VARIANT=cuda --build-arg TORCH_CUDA=cu128 .
+```
+
+### Run tests in Docker
+
+There’s also a `test` stage that includes dev dependencies and runs `pytest`.
+
+```powershell
+docker build -t qwen3-server:test --target test .
+docker run --rm qwen3-server:test
 ```
 
 ### Run (Docker + NVIDIA GPU)
@@ -111,7 +122,24 @@ You need:
 Example:
 
 ```powershell
-docker run --rm -p 8000:8000 -v ${PWD}\audio:/app/audio --gpus all -e DEVICE=cuda -e TORCH_DTYPE=float16 qwen3-server:cu121
+docker run --rm -p 8000:8000 -v ${PWD}\audio:/app/audio --gpus all -e DEVICE=cuda -e TORCH_DTYPE=float16 qwen3-server:cu128
+
+### RTX 50-series (sm_120) / Blackwell GPUs
+
+If you have an RTX 50-series GPU (compute capability `sm_120`) and you see an error like:
+
+- `no kernel image is available for execution on the device`
+
+then your image is using a PyTorch wheel that doesn't include `sm_120` kernels.
+
+Use **PyTorch CUDA 12.8+ wheels**, i.e. build/pull an image using `TORCH_CUDA=cu128`.
+
+If you can't use GPU for any reason, you can force CPU:
+
+```powershell
+$env:DEVICE="cpu"
+python -m app
+```
 ```
 
 > Note: The base image is still `python:3.11-slim`. CUDA-enabled PyTorch inside the container still requires:

@@ -9,6 +9,7 @@ from typing import Any, Protocol
 
 from .config import Settings
 from .preview_audio import write_sine_wav
+from .torch_compat import torch_arch_mismatch_hint
 
 
 class TTSError(RuntimeError):
@@ -97,7 +98,10 @@ class QwenTTSBackend:
                 device_map=device_map,
                 dtype=dtype,
             )
-        except Exception:
+        except Exception as e:
+            hint = torch_arch_mismatch_hint(e)
+            if hint is not None:
+                raise TTSError(f"{hint.title}. {hint.suggested_action}") from e
             # If CUDA was requested but fails (missing drivers, wrong torch wheel), fall back to CPU.
             if device.startswith("cuda") or device_map == "cuda":
                 self._log.exception("Failed to load model on CUDA; falling back to CPU")
@@ -138,6 +142,11 @@ class QwenTTSBackend:
                 ref_text="",
                 x_vector_only_mode=True,
             )
+        except Exception as e:
+            hint = torch_arch_mismatch_hint(e)
+            if hint is not None:
+                raise TTSError(f"{hint.title}. {hint.suggested_action}") from e
+            raise
 
         try:
             wavs, sr = model.generate_voice_clone(
@@ -153,6 +162,11 @@ class QwenTTSBackend:
                 ref_audio=str(source_wav),
                 ref_text=None,
             )
+        except Exception as e:
+            hint = torch_arch_mismatch_hint(e)
+            if hint is not None:
+                raise TTSError(f"{hint.title}. {hint.suggested_action}") from e
+            raise
 
         if not wavs:
             raise TTSError("No audio generated")

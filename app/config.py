@@ -53,6 +53,12 @@ class Settings:
     # Server
     uvicorn_workers: int = 1
 
+    # Torch low-level backend toggles
+    # NNPACK is a CPU-only backend; on many VMs/CPUs it prints noisy warnings like
+    # "Could not initialize NNPACK! Reason: Unsupported hardware.".
+    # Disabling it is safe for CUDA workloads and keeps logs clean.
+    disable_torch_nnpack: bool = True
+
     @property
     def previews_dir(self) -> Path:
         return self.audio_root / "previews"
@@ -81,4 +87,5 @@ def get_settings() -> Settings:
         torch_dtype=os.getenv("TORCH_DTYPE", "auto").strip().lower() or "auto",
         device_map=os.getenv("DEVICE_MAP", "auto").strip().lower() or "auto",
         uvicorn_workers=max(1, _env_int("UVICORN_WORKERS", 1)),
+        disable_torch_nnpack=_env_bool("DISABLE_TORCH_NNPACK", True),
     )

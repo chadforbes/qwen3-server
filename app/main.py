@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 import time
 import uuid
+from typing import Any
 
 from fastapi import FastAPI, File, UploadFile, WebSocket
 from fastapi.responses import FileResponse, JSONResponse
@@ -34,6 +36,69 @@ from .log_utils import safe_preview_payload
 log = logging.getLogger(__name__)
 
 
+def _torch_startup_diagnostics(settings) -> dict[str, Any]:
+    """Best-effort torch/device diagnostics for startup logs.
+
+    Keep this resilient: it must never crash startup if torch isn't importable
+    or if CUDA libraries aren't present.
+    """
+
+    info: dict[str, Any] = {
+        "settings_device": getattr(settings, "device", None),
+        "settings_torch_dtype": getattr(settings, "torch_dtype", None),
+        "settings_device_map": getattr(settings, "device_map", None),
+        "disable_torch_nnpack": getattr(settings, "disable_torch_nnpack", None),
+        "torch_disable_nnpack_env": os.getenv("TORCH_DISABLE_NNPACK"),
+    }
+
+    try:
+        import torch
+
+        info.update(
+            {
+                "torch_version": getattr(torch, "__version__", None),
+                "torch_cuda_version": getattr(getattr(torch, "version", None), "cuda", None),
+                "cuda_available": bool(torch.cuda.is_available()),
+                "cuda_device_count": int(torch.cuda.device_count()) if torch.cuda.is_available() else 0,
+                "cuda_devices": [
+                    torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())
+                ]
+                if torch.cuda.is_available()
+                else [],
+            }
+        )
+
+        # Resolve the effective device/dtype using the same rules as our backend.
+        device = (settings.device or "auto").lower() if getattr(settings, "device", None) else "auto"
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        device_map = (settings.device_map or "auto").lower() if getattr(settings, "device_map", None) else "auto"
+        if device_map == "auto":
+            device_map = "cuda" if device.startswith("cuda") else "cpu"
+
+        dtype_setting = (settings.torch_dtype or "auto").lower() if getattr(settings, "torch_dtype", None) else "auto"
+        if dtype_setting == "auto":
+            dtype = torch.float16 if device.startswith("cuda") else torch.float32
+        else:
+            dtype = {
+                "float32": torch.float32,
+                "float16": torch.float16,
+                "bfloat16": torch.bfloat16,
+            }.get(dtype_setting, torch.float32)
+
+        info.update(
+            {
+                "effective_device": device,
+                "effective_device_map": device_map,
+                "effective_dtype": str(dtype).replace("torch.", ""),
+            }
+        )
+    except Exception as e:
+        info["torch_error"] = f"{type(e).__name__}: {e}"
+
+    return info
+
+
 def _safe_file_response(path: Path) -> FileResponse:
     # FileResponse will stream the file; this helper keeps a single place for settings.
     return FileResponse(path=str(path), media_type="audio/wav")
@@ -42,7 +107,31 @@ def _safe_file_response(path: Path) -> FileResponse:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
+
+    # Apply low-level torch env toggles as early as possible.
+    # Must be set before importing torch for it to take effect.
+    if settings.disable_torch_nnpack:
+        # PyTorch recognizes TORCH_DISABLE_NNPACK=1 to skip NNPACK init.
+        os.environ.setdefault("TORCH_DISABLE_NNPACK", "1")
+
     configure_logging(settings.log_level, fmt=settings.log_format)
+
+    # Device / torch diagnostics (helps confirm container has the right torch wheel + CUDA visibility)
+    diag = _torch_startup_diagnostics(settings)
+    log.info(
+        "startup torch_diagnostics settings_device=%s settings_device_map=%s settings_torch_dtype=%s effective_device=%s effective_device_map=%s effective_dtype=%s torch_version=%s cuda_available=%s cuda_device_count=%s cuda_devices=%s",
+        diag.get("settings_device"),
+        diag.get("settings_device_map"),
+        diag.get("settings_torch_dtype"),
+        diag.get("effective_device"),
+        diag.get("effective_device_map"),
+        diag.get("effective_dtype"),
+        diag.get("torch_version"),
+        diag.get("cuda_available"),
+        diag.get("cuda_device_count"),
+        diag.get("cuda_devices"),
+    )
+
     ensure_dirs(settings)
     app.state.settings = settings
     app.state.tts_backend = build_backend(settings)
