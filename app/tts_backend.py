@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -49,6 +50,182 @@ class QwenTTSBackend:
         self._cpu_model = None
         self._cuda_disabled = False
         self._log = logging.getLogger(__name__)
+        # Cache the most recent voice-clone prompt derived from a reference WAV.
+        # Building it can be expensive; for the common workflow (same reference
+        # audio, many response_text iterations) this provides a big speedup.
+        self._prompt_cache_lock = threading.Lock()
+        self._prompt_cache_key: tuple[int, str, int, int] | None = None
+        self._prompt_cache_value: Any | None = None
+
+    @staticmethod
+    def _source_sig(source_wav: Path) -> tuple[str, int, int]:
+        st = source_wav.stat()
+        # Keyed by resolved path + mtime_ns + size to avoid stale cache when
+        # the file is replaced in-place (e.g. uploads/latest/source.wav).
+        return (str(source_wav.resolve()), int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))), int(st.st_size))
+
+    def _effective_device_for_tensors(self) -> str:
+        """Best-effort runtime device selection for prompt tensors.
+
+        Keep this conservative: if CUDA is disabled or unavailable, stay on CPU.
+        """
+
+        if self._cuda_disabled:
+            return "cpu"
+        try:
+            import torch
+
+            if not torch.cuda.is_available():
+                return "cpu"
+        except Exception:
+            return "cpu"
+
+        device = (self._settings.device or "auto").lower()
+        if device == "auto":
+            return "cuda"
+        if device.startswith("cuda"):
+            return device
+        return "cpu"
+
+    @staticmethod
+    def _move_prompt_to_device(prompt: dict[str, Any], *, device: str) -> dict[str, Any]:
+        try:
+            import torch
+        except Exception:
+            return prompt
+
+        if device == "cpu":
+            # Ensure tensors are on CPU for portability.
+            def to_cpu(x: Any) -> Any:
+                if isinstance(x, torch.Tensor):
+                    return x.detach().to("cpu")
+                if isinstance(x, list):
+                    return [to_cpu(v) for v in x]
+                if isinstance(x, dict):
+                    return {k: to_cpu(v) for k, v in x.items()}
+                return x
+
+            return to_cpu(prompt)
+
+        def to_dev(x: Any) -> Any:
+            if isinstance(x, torch.Tensor):
+                return x.to(device)
+            if isinstance(x, list):
+                return [to_dev(v) for v in x]
+            if isinstance(x, dict):
+                return {k: to_dev(v) for k, v in x.items()}
+            return x
+
+        return to_dev(prompt)
+
+    def _load_prompt_from_pt(self, *, source_wav: Path) -> dict[str, Any] | None:
+        """Load persisted prompt dict if available.
+
+        We persist a torch-serialized file for saved voices so prompts can be
+        reused across restarts without JSON coercion issues.
+        """
+
+        pt_path = source_wav.parent / "embedding.pt"
+        if not pt_path.exists():
+            return None
+        try:
+            import torch
+
+            payload = torch.load(str(pt_path), map_location="cpu")
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("type") != "qwen3_voice_clone_prompt_pt_v1":
+            return None
+        if payload.get("model_id") != self._settings.qwen_model_id:
+            return None
+        prompt = payload.get("voice_clone_prompt")
+        if not isinstance(prompt, dict):
+            return None
+
+        device = self._effective_device_for_tensors()
+        self._log.debug("voice_clone_prompt_loaded source=pt path=%s", str(pt_path))
+        return self._move_prompt_to_device(prompt, device=device)
+
+    def _maybe_persist_prompt_pt(self, *, source_wav: Path, voice_clone_prompt: dict[str, Any]) -> None:
+        """Persist prompt next to source.wav when it looks like a saved voice.
+
+        This enables faster preview-from-voice across restarts without requiring
+        the user to re-save the voice.
+        """
+
+        # Only do this for saved voices (audio/voices/<id>/source.wav), not for uploads/latest.
+        if not (source_wav.parent / "metadata.json").exists():
+            return
+        pt_path = source_wav.parent / "embedding.pt"
+        if pt_path.exists():
+            return
+        try:
+            import torch
+
+            payload = {
+                "type": "qwen3_voice_clone_prompt_pt_v1",
+                "model_id": self._settings.qwen_model_id,
+                "voice_clone_prompt": self._move_prompt_to_device(voice_clone_prompt, device="cpu"),
+            }
+            torch.save(payload, str(pt_path))
+            self._log.debug("voice_clone_prompt_persisted source=computed path=%s", str(pt_path))
+        except Exception:
+            # Non-fatal.
+            return
+
+    def _get_voice_clone_prompt_with_source(self, model: Any, *, source_wav: Path) -> tuple[dict[str, Any], str]:
+        # Prefer persisted prompt for saved voices.
+        persisted = self._load_prompt_from_pt(source_wav=source_wav)
+        if persisted is not None:
+            return persisted, "pt"
+
+        source_path, mtime_ns, size = self._source_sig(source_wav)
+        device = self._effective_device_for_tensors()
+        cache_key = (id(model), source_path, mtime_ns, size, device)
+
+        with self._prompt_cache_lock:
+            if self._prompt_cache_key == cache_key and self._prompt_cache_value is not None:
+                self._log.debug("voice_clone_prompt_loaded source=cache")
+                return self._prompt_cache_value, "cache"
+
+        # Compute outside lock to avoid blocking unrelated callers.
+        try:
+            items = model.create_voice_clone_prompt(
+                ref_audio=str(source_wav),
+                ref_text=None,
+                x_vector_only_mode=True,
+            )
+        except TypeError:
+            # Older API variants: fall back to passing ref_text if required.
+            items = model.create_voice_clone_prompt(
+                ref_audio=str(source_wav),
+                ref_text="",
+                x_vector_only_mode=True,
+            )
+
+        # Convert to the dict form `generate_voice_clone(..., voice_clone_prompt=...)` accepts.
+        # This avoids needing qwen-tts's internal VoiceClonePromptItem class outside this call.
+        prompt: dict[str, Any] = {
+            "ref_code": [getattr(it, "ref_code", None) for it in (items or [])],
+            "ref_spk_embedding": [getattr(it, "ref_spk_embedding", None) for it in (items or [])],
+            "x_vector_only_mode": [bool(getattr(it, "x_vector_only_mode", True)) for it in (items or [])],
+            "icl_mode": [bool(getattr(it, "icl_mode", False)) for it in (items or [])],
+        }
+        prompt = self._move_prompt_to_device(prompt, device=device)
+
+        # If this is a saved voice, persist for next time.
+        self._maybe_persist_prompt_pt(source_wav=source_wav, voice_clone_prompt=prompt)
+
+        with self._prompt_cache_lock:
+            self._prompt_cache_key = cache_key
+            self._prompt_cache_value = prompt
+        return prompt, "computed"
+
+    def _get_voice_clone_prompt(self, model: Any, *, source_wav: Path) -> dict[str, Any]:
+        prompt, _src = self._get_voice_clone_prompt_with_source(model, source_wav=source_wav)
+        return prompt
 
     @staticmethod
     def _is_invalid_probability_error(exc: BaseException) -> bool:
@@ -175,34 +352,73 @@ class QwenTTSBackend:
 
         def _run_generate(m):
             # Voice cloning only: build a clone prompt from the uploaded reference audio.
+            t_prompt0 = None
             try:
-                voice_clone_prompt = m.create_voice_clone_prompt(
-                    ref_audio=str(source_wav),
-                    ref_text=None,
-                    x_vector_only_mode=True,
-                )
-            except TypeError:
-                # Older API variants: fall back to passing ref_text if required.
-                voice_clone_prompt = m.create_voice_clone_prompt(
-                    ref_audio=str(source_wav),
-                    ref_text="",
-                    x_vector_only_mode=True,
-                )
+                t_prompt0 = __import__("time").perf_counter()
+            except Exception:
+                t_prompt0 = None
+
+            voice_clone_prompt, prompt_source = self._get_voice_clone_prompt_with_source(m, source_wav=source_wav)
+
+            t_prompt_ms = None
+            if t_prompt0 is not None:
+                try:
+                    t_prompt_ms = int((__import__("time").perf_counter() - t_prompt0) * 1000)
+                except Exception:
+                    t_prompt_ms = None
+
+            t_gen0 = None
+            try:
+                t_gen0 = __import__("time").perf_counter()
+            except Exception:
+                t_gen0 = None
+
+            gen_kwargs: dict[str, Any] = {}
+            if self._settings.qwen_max_new_tokens is not None and self._settings.qwen_max_new_tokens > 0:
+                gen_kwargs["max_new_tokens"] = int(self._settings.qwen_max_new_tokens)
+            if getattr(self._settings, "qwen_non_streaming_mode", False):
+                gen_kwargs["non_streaming_mode"] = True
 
             try:
-                return m.generate_voice_clone(
+                out = m.generate_voice_clone(
                     text=text,
                     language="Auto",
                     voice_clone_prompt=voice_clone_prompt,
+                    **gen_kwargs,
                 )
             except TypeError:
                 # Some versions accept ref_audio directly.
-                return m.generate_voice_clone(
+                out = m.generate_voice_clone(
                     text=text,
                     language="Auto",
                     ref_audio=str(source_wav),
                     ref_text=None,
+                    **gen_kwargs,
                 )
+
+            t_gen_ms = None
+            if t_gen0 is not None:
+                try:
+                    t_gen_ms = int((__import__("time").perf_counter() - t_gen0) * 1000)
+                except Exception:
+                    t_gen_ms = None
+
+            if getattr(self._settings, "log_qwen_timings", False):
+                self._log.info(
+                    "qwen_tts_timing prompt_source=%s prompt_ms=%s generate_ms=%s",
+                    prompt_source,
+                    t_prompt_ms if t_prompt_ms is not None else "-",
+                    t_gen_ms if t_gen_ms is not None else "-",
+                )
+            else:
+                self._log.debug(
+                    "qwen_tts_timing prompt_source=%s prompt_ms=%s generate_ms=%s",
+                    prompt_source,
+                    t_prompt_ms if t_prompt_ms is not None else "-",
+                    t_gen_ms if t_gen_ms is not None else "-",
+                )
+
+            return out
 
         model = self._load_model()
         try:
@@ -240,22 +456,30 @@ class QwenTTSBackend:
 
     def create_embedding(self, *, source_wav: Path) -> dict[str, Any]:
         model = self._load_model()
-        try:
-            prompt = model.create_voice_clone_prompt(
-                ref_audio=str(source_wav),
-                ref_text=None,
-                x_vector_only_mode=True,
-            )
-        except TypeError:
-            prompt = model.create_voice_clone_prompt(
-                ref_audio=str(source_wav),
-                ref_text="",
-                x_vector_only_mode=True,
-            )
+        voice_clone_prompt = self._get_voice_clone_prompt(model, source_wav=source_wav)
 
-        # Best-effort JSON-serializable structure.
-        serializable = json.loads(json.dumps(prompt, default=str))
-        return {"type": "qwen3_voice_clone_prompt", "model_id": self._settings.qwen_model_id, "prompt": serializable}
+        # Persist a torch-serialized prompt for reuse across restarts.
+        try:
+            import torch
+
+            pt_path = source_wav.parent / "embedding.pt"
+            payload = {
+                "type": "qwen3_voice_clone_prompt_pt_v1",
+                "model_id": self._settings.qwen_model_id,
+                "voice_clone_prompt": self._move_prompt_to_device(voice_clone_prompt, device="cpu"),
+            }
+            torch.save(payload, str(pt_path))
+        except Exception:
+            # Non-fatal; prompt will still be cached in-memory and can be backfilled
+            # during generation.
+            pass
+
+        # Keep embedding.json lightweight and stable.
+        return {
+            "type": "qwen3_voice_clone_prompt_pt_v1",
+            "model_id": self._settings.qwen_model_id,
+            "prompt_file": "embedding.pt",
+        }
 
 
 def build_backend(settings: Settings) -> TTSBackend:

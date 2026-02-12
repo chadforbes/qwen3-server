@@ -109,9 +109,50 @@ def _torch_startup_diagnostics(settings) -> dict[str, Any]:
     return info
 
 
+def _torch_performance_tweaks() -> dict[str, Any]:
+    """Best-effort performance toggles.
+
+    These are safe-ish defaults that can improve throughput on CUDA.
+    They should never crash startup.
+    """
+
+    applied: dict[str, Any] = {}
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            # TF32 can speed up float32 matmuls on Ampere+.
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                applied["tf32"] = True
+            except Exception:
+                applied["tf32"] = "unsupported"
+
+            # Prefer faster matmul kernels when available.
+            try:
+                torch.set_float32_matmul_precision("high")
+                applied["matmul_precision"] = "high"
+            except Exception:
+                applied["matmul_precision"] = "unsupported"
+
+            # Encourage Flash/efficient SDPA when possible (PyTorch will fall back safely).
+            try:
+                sdp_kernel = getattr(torch.backends.cuda, "sdp_kernel", None)
+                if callable(sdp_kernel):
+                    torch.backends.cuda.sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=True)
+                    applied["sdp_kernel"] = "flash/mem_efficient"
+            except Exception:
+                applied["sdp_kernel"] = "unsupported"
+    except Exception as e:
+        applied["error"] = f"{type(e).__name__}: {e}"
+
+    return applied
+
+
 def _safe_file_response(path: Path) -> FileResponse:
     # FileResponse will stream the file; this helper keeps a single place for settings.
-    return FileResponse(path=str(path), media_type="audio/wav")
+    return FileResponse(path=str(path), media_type="audio/wav", filename="preview.wav")
 
 
 @asynccontextmanager
@@ -141,6 +182,10 @@ async def lifespan(app: FastAPI):
         diag.get("cuda_device_count"),
         diag.get("cuda_devices"),
     )
+
+    tweaks = _torch_performance_tweaks()
+    if tweaks:
+        log.info("startup torch_perf_tweaks %s", tweaks)
 
     ensure_dirs(settings)
     app.state.settings = settings
@@ -269,8 +314,6 @@ def voices_list():
 
 # New /preview endpoint: accepts audio, transcription, and response text, returns generated audio
 from fastapi import Form
-from fastapi.responses import StreamingResponse
-import io
 
 @app.post("/preview")
 async def preview(
@@ -331,12 +374,7 @@ async def preview(
         if is_cuda_device_side_assert(e):
             return JSONResponse(status_code=500, content=cuda_assert_payload(e))
         return JSONResponse(status_code=500, content={"error": str(e)})
-    # Return the generated audio file as a streaming response
-    return StreamingResponse(
-        io.BytesIO(out_wav.read_bytes()),
-        media_type="audio/wav",
-        headers={"Content-Disposition": f"attachment; filename=preview.wav"},
-    )
+    return _safe_file_response(out_wav)
 
 
 @app.post("/preview-from-voice")
@@ -398,11 +436,7 @@ async def preview_from_voice(
             return JSONResponse(status_code=500, content=cuda_assert_payload(e))
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-    return StreamingResponse(
-        io.BytesIO(out_wav.read_bytes()),
-        media_type="audio/wav",
-        headers={"Content-Disposition": "attachment; filename=preview.wav"},
-    )
+    return _safe_file_response(out_wav)
 
 
 # @app.get("/previews/{job_id}.wav")

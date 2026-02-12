@@ -27,12 +27,32 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_int_optional(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if raw == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 @dataclass(frozen=True)
 class Settings:
     audio_root: Path
     tts_backend: str = "qwen"  # qwen | mock
     qwen_model_id: str = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
     preload_model_on_startup: bool = True
+    # Optional generation tuning (primarily affects speed vs length/quality).
+    qwen_max_new_tokens: int | None = None
+    qwen_non_streaming_mode: bool = False
+
+    # Diagnostics
+    # If enabled, log timing breakdowns for qwen-tts calls.
+    log_qwen_timings: bool = False
     log_level: str = "INFO"
     log_format: str = "text"  # text | json
     log_payload_chars: int = 500
@@ -84,6 +104,9 @@ def get_settings() -> Settings:
         qwen_model_id=os.getenv("QWEN_TTS_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-0.6B-Base").strip()
         or "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
         preload_model_on_startup=_env_bool("PRELOAD_MODEL_ON_STARTUP", True),
+        qwen_max_new_tokens=_env_int_optional("QWEN_MAX_NEW_TOKENS"),
+        qwen_non_streaming_mode=_env_bool("QWEN_NON_STREAMING_MODE", False),
+        log_qwen_timings=_env_bool("LOG_QWEN_TIMINGS", False),
         log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO",
         log_format=os.getenv("LOG_FORMAT", "text").strip().lower() or "text",
         log_payload_chars=_env_int("LOG_PAYLOAD_CHARS", 500),
