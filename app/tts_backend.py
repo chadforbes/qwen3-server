@@ -10,6 +10,7 @@ from typing import Any, Protocol
 from .config import Settings
 from .preview_audio import write_sine_wav
 from .torch_compat import torch_arch_mismatch_hint
+from .torch_utils import is_cuda_device_side_assert
 
 
 class TTSError(RuntimeError):
@@ -45,11 +46,48 @@ class QwenTTSBackend:
     def __init__(self, *, settings: Settings) -> None:
         self._settings = settings
         self._model = None
+        self._cpu_model = None
+        self._cuda_disabled = False
         self._log = logging.getLogger(__name__)
+
+    @staticmethod
+    def _is_invalid_probability_error(exc: BaseException) -> bool:
+        # Common torch.multinomial CUDA assertion text.
+        msg = str(exc).lower()
+        if "probability tensor contains" in msg:
+            return True
+        if "torch.multinomial" in msg and ("nan" in msg or "inf" in msg or "< 0" in msg or "<0" in msg):
+            return True
+        return False
+
+    def _load_cpu_model(self):
+        if self._cpu_model is not None:
+            return self._cpu_model
+        try:
+            import torch
+            from qwen_tts import Qwen3TTSModel
+        except Exception as e:
+            raise TTSError(
+                "Qwen TTS backend not available. Install dependencies: pip install qwen-tts torch"
+            ) from e
+
+        self._log.info(
+            "Loading Qwen3 TTS model on CPU for fallback model_id=%s",
+            self._settings.qwen_model_id,
+        )
+        self._cpu_model = Qwen3TTSModel.from_pretrained(
+            self._settings.qwen_model_id,
+            device_map="cpu",
+            dtype=torch.float32,
+        )
+        return self._cpu_model
 
     def _load_model(self):
         if self._model is not None:
             return self._model
+
+        if self._cuda_disabled:
+            return self._load_cpu_model()
         try:
             if shutil.which("sox") is None:
                 self._log.warning("SoX binary not found on PATH; qwen-tts may fail at runtime")
@@ -74,8 +112,20 @@ class QwenTTSBackend:
         # dtype selection
         dtype_setting = (self._settings.torch_dtype or "auto").lower()
         if dtype_setting == "auto":
-            # CUDA defaults to float16 to reduce VRAM; CPU stays float32.
-            dtype = torch.float16 if device.startswith("cuda") else torch.float32
+            # CUDA defaults to reduced precision to reduce VRAM.
+            # Prefer bfloat16 when supported (often more numerically stable than float16).
+            # If bf16 isn't supported, default to float32 for stability.
+            # (Users can still force float16 via TORCH_DTYPE=float16.)
+            if device.startswith("cuda"):
+                bf16_supported = False
+                try:
+                    is_bf16_supported = getattr(torch.cuda, "is_bf16_supported", None)
+                    bf16_supported = bool(is_bf16_supported()) if callable(is_bf16_supported) else False
+                except Exception:
+                    bf16_supported = False
+                dtype = torch.bfloat16 if bf16_supported else torch.float32
+            else:
+                dtype = torch.float32
         else:
             dtype = {
                 "float32": torch.float32,
@@ -105,11 +155,8 @@ class QwenTTSBackend:
             # If CUDA was requested but fails (missing drivers, wrong torch wheel), fall back to CPU.
             if device.startswith("cuda") or device_map == "cuda":
                 self._log.exception("Failed to load model on CUDA; falling back to CPU")
-                self._model = Qwen3TTSModel.from_pretrained(
-                    self._settings.qwen_model_id,
-                    device_map="cpu",
-                    dtype=torch.float32,
-                )
+                self._cuda_disabled = True
+                self._model = self._load_cpu_model()
             else:
                 raise
         return self._model
@@ -126,47 +173,59 @@ class QwenTTSBackend:
         if not source_wav.exists():
             raise TTSError("source.wav not found")
 
+        def _run_generate(m):
+            # Voice cloning only: build a clone prompt from the uploaded reference audio.
+            try:
+                voice_clone_prompt = m.create_voice_clone_prompt(
+                    ref_audio=str(source_wav),
+                    ref_text=None,
+                    x_vector_only_mode=True,
+                )
+            except TypeError:
+                # Older API variants: fall back to passing ref_text if required.
+                voice_clone_prompt = m.create_voice_clone_prompt(
+                    ref_audio=str(source_wav),
+                    ref_text="",
+                    x_vector_only_mode=True,
+                )
+
+            try:
+                return m.generate_voice_clone(
+                    text=text,
+                    language="Auto",
+                    voice_clone_prompt=voice_clone_prompt,
+                )
+            except TypeError:
+                # Some versions accept ref_audio directly.
+                return m.generate_voice_clone(
+                    text=text,
+                    language="Auto",
+                    ref_audio=str(source_wav),
+                    ref_text=None,
+                )
+
         model = self._load_model()
-
-        # Voice cloning only: build a clone prompt from the uploaded reference audio.
         try:
-            voice_clone_prompt = model.create_voice_clone_prompt(
-                ref_audio=str(source_wav),
-                ref_text=None,
-                x_vector_only_mode=True,
-            )
-        except TypeError:
-            # Older API variants: fall back to passing ref_text if required.
-            voice_clone_prompt = model.create_voice_clone_prompt(
-                ref_audio=str(source_wav),
-                ref_text="",
-                x_vector_only_mode=True,
-            )
+            wavs, sr = _run_generate(model)
         except Exception as e:
             hint = torch_arch_mismatch_hint(e)
             if hint is not None:
                 raise TTSError(f"{hint.title}. {hint.suggested_action}") from e
-            raise
 
-        try:
-            wavs, sr = model.generate_voice_clone(
-                text=text,
-                language="Auto",
-                voice_clone_prompt=voice_clone_prompt,
+            should_fallback = (
+                self._settings.cuda_fallback_to_cpu
+                and not self._cuda_disabled
+                and (is_cuda_device_side_assert(e) or self._is_invalid_probability_error(e))
             )
-        except TypeError:
-            # Some versions accept ref_audio directly.
-            wavs, sr = model.generate_voice_clone(
-                text=text,
-                language="Auto",
-                ref_audio=str(source_wav),
-                ref_text=None,
-            )
-        except Exception as e:
-            hint = torch_arch_mismatch_hint(e)
-            if hint is not None:
-                raise TTSError(f"{hint.title}. {hint.suggested_action}") from e
-            raise
+            if not should_fallback:
+                raise
+
+            # After a CUDA device-side assert, the CUDA context is typically poisoned for the
+            # lifetime of the process. Switch to CPU for subsequent requests.
+            self._cuda_disabled = True
+            self._log.exception("Qwen TTS CUDA failure during generate; retrying on CPU")
+            cpu_model = self._load_cpu_model()
+            wavs, sr = _run_generate(cpu_model)
 
         if not wavs:
             raise TTSError("No audio generated")

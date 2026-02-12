@@ -66,7 +66,11 @@ GPU / Torch selection:
 Notes:
 
 - With `DEVICE=auto`, the server will use `cuda` if `torch.cuda.is_available()` is true, otherwise CPU.
-- With CUDA, `TORCH_DTYPE=auto` will prefer `float16` to reduce VRAM usage.
+- With CUDA, `TORCH_DTYPE=auto` will prefer `bfloat16` when supported (often more stable), otherwise `float32`.
+
+Misc:
+
+- `DISABLE_TORCH_NNPACK` = `1` (default) to disable PyTorch NNPACK CPU backend probing (reduces noisy warnings on some hardware).
 
 - First run will download the model from Hugging Face.
 - `embedding.json` stores a Qwen "voice clone prompt" when using `qwen`.
@@ -122,7 +126,7 @@ You need:
 Example:
 
 ```powershell
-docker run --rm -p 8000:8000 -v ${PWD}\audio:/app/audio --gpus all -e DEVICE=cuda -e TORCH_DTYPE=float16 qwen3-server:cu128
+docker run --rm -p 8000:8000 -v ${PWD}\audio:/app/audio --gpus all -e DEVICE=cuda -e TORCH_DTYPE=auto qwen3-server:cu128
 
 ### RTX 50-series (sm_120) / Blackwell GPUs
 

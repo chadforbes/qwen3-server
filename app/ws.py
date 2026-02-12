@@ -15,6 +15,7 @@ from .storage import ValidationError, load_latest_preview, preview_path, save_vo
 from .tts_backend import TTSBackend, TTSError
 from .log_context import set_correlation_id
 from .log_utils import safe_preview_payload
+from .torch_utils import is_cuda_device_side_assert
 
 
 log = logging.getLogger(__name__)
@@ -69,6 +70,13 @@ async def handle_message(
             )
         except TTSError as e:
             log.exception("generate_preview failed")
+            raise ValidationError(str(e))
+        except Exception as e:
+            log.exception("generate_preview failed")
+            if is_cuda_device_side_assert(e):
+                raise ValidationError(
+                    "CUDA device-side assert triggered. Restart the server container. Try TORCH_DTYPE=bfloat16 (or float32)."
+                )
             raise ValidationError(str(e))
 
         await ws_send(

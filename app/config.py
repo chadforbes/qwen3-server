@@ -59,6 +59,10 @@ class Settings:
     # Disabling it is safe for CUDA workloads and keeps logs clean.
     disable_torch_nnpack: bool = True
 
+    # If CUDA hits a device-side assert (or invalid multinomial probs) during generation,
+    # retry once on CPU and keep subsequent synth on CPU to keep the server usable.
+    cuda_fallback_to_cpu: bool = True
+
     @property
     def previews_dir(self) -> Path:
         return self.audio_root / "previews"
@@ -88,4 +92,5 @@ def get_settings() -> Settings:
         device_map=os.getenv("DEVICE_MAP", "auto").strip().lower() or "auto",
         uvicorn_workers=max(1, _env_int("UVICORN_WORKERS", 1)),
         disable_torch_nnpack=_env_bool("DISABLE_TORCH_NNPACK", True),
+        cuda_fallback_to_cpu=_env_bool("CUDA_FALLBACK_TO_CPU", True),
     )

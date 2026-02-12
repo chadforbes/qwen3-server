@@ -1,4 +1,4 @@
-FROM python:3.11-slim AS base
+FROM python:3.11-slim
 
 WORKDIR /app
 
@@ -16,9 +16,9 @@ COPY requirements-dev.txt /app/requirements-dev.txt
 #
 # Examples:
 #   docker build -t qwen3-server .
-#   docker build -t qwen3-server:cu128 --build-arg TORCH_VARIANT=cuda --build-arg TORCH_CUDA=cu128 .
+#   docker build -t qwen3-server:cu121 --build-arg TORCH_VARIANT=cuda --build-arg TORCH_CUDA=cu121 .
 ARG TORCH_VARIANT=cpu
-ARG TORCH_CUDA=cu128
+ARG TORCH_CUDA=cu121
 ARG QWEN_TTS_VERSION=0.0.5
 
 # qwen-tts uses a number of optional deps; our server backend requires these at
@@ -38,27 +38,13 @@ RUN if [ "$TORCH_VARIANT" = "cuda" ]; then \
 # the rest of the pinned requirements.
 RUN pip install --no-cache-dir --no-deps qwen-tts==${QWEN_TTS_VERSION} \
  && pip install --no-cache-dir ${QWEN_TTS_EXTRAS} \
- && pip install --no-cache-dir -r /app/requirements.txt
-
-
-FROM base AS runtime
-
-COPY app /app/app
-COPY scripts /app/scripts
-
-EXPOSE 8000
-
-CMD ["python", "-m", "app"]
-
-
-FROM base AS test
-
-# Install dev/test requirements only in this stage.
-RUN pip install --no-cache-dir -r /app/requirements-dev.txt
+ && pip install --no-cache-dir -r /app/requirements.txt \
+ && pip install --no-cache-dir -r /app/requirements-dev.txt
 
 COPY app /app/app
 COPY tests /app/tests
 COPY scripts /app/scripts
 
-# Default command for CI/local validation.
-CMD ["python", "-m", "pytest", "-q"]
+EXPOSE 8000
+
+CMD ["python", "-m", "app"]

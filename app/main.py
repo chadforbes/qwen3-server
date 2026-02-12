@@ -31,6 +31,7 @@ from .tts_backend import build_backend
 from .logging_config import configure_logging
 from .log_context import set_correlation_id
 from .log_utils import safe_preview_payload
+from .torch_utils import cuda_assert_payload, is_cuda_device_side_assert
 
 
 log = logging.getLogger(__name__)
@@ -78,7 +79,16 @@ def _torch_startup_diagnostics(settings) -> dict[str, Any]:
 
         dtype_setting = (settings.torch_dtype or "auto").lower() if getattr(settings, "torch_dtype", None) else "auto"
         if dtype_setting == "auto":
-            dtype = torch.float16 if device.startswith("cuda") else torch.float32
+            if device.startswith("cuda"):
+                bf16_supported = False
+                try:
+                    is_bf16_supported = getattr(torch.cuda, "is_bf16_supported", None)
+                    bf16_supported = bool(is_bf16_supported()) if callable(is_bf16_supported) else False
+                except Exception:
+                    bf16_supported = False
+                dtype = torch.bfloat16 if bf16_supported else torch.float32
+            else:
+                dtype = torch.float32
         else:
             dtype = {
                 "float32": torch.float32,
@@ -318,6 +328,8 @@ async def preview(
             "latest",
             safe_preview_payload(response_text, limit_chars=settings.log_payload_chars),
         )
+        if is_cuda_device_side_assert(e):
+            return JSONResponse(status_code=500, content=cuda_assert_payload(e))
         return JSONResponse(status_code=500, content={"error": str(e)})
     # Return the generated audio file as a streaming response
     return StreamingResponse(
@@ -382,6 +394,8 @@ async def preview_from_voice(
             voice_id,
             safe_preview_payload(response_text, limit_chars=settings.log_payload_chars),
         )
+        if is_cuda_device_side_assert(e):
+            return JSONResponse(status_code=500, content=cuda_assert_payload(e))
         return JSONResponse(status_code=500, content={"error": str(e)})
 
     return StreamingResponse(
